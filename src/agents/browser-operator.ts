@@ -380,6 +380,34 @@ export async function crawl(
       queued.add(s);
       frontier.push(s);
     };
+    // Fallback frontier: a page's own links read BEFORE its clicks. Walked only once the main frontier
+    // is exhausted (the exact point where the crawl used to stop), so the main walk keeps its order and
+    // pages, and the fallback only adds pages on top. Its dedup set is separate, so a URL the main
+    // frontier finds later is still walked in main order, never delayed behind the fallback.
+    const fallback: string[] = [];
+    const fallbackQueued = new Set<string>();
+    const enqueueFallback = (u: string): void => {
+      let n: URL;
+      try {
+        n = new URL(u);
+      } catch {
+        return;
+      }
+      if (n.protocol !== "http:" && n.protocol !== "https:") return;
+      if (!inScopeHost(n.hostname.toLowerCase())) return;
+      n.hash = "";
+      const s = n.href;
+      if (visited.has(s) || queued.has(s) || fallbackQueued.has(s)) return;
+      fallbackQueued.add(s);
+      fallback.push(s);
+    };
+    const takeFallback = (): string | undefined => {
+      while (fallback.length) {
+        const s = fallback.shift()!;
+        if (!visited.has(s)) return s;
+      }
+      return undefined;
+    };
     // A URL harvested from JS is only worth WALKING once its host proves to be part of the app: i.e. we
     // actually load first-party JS from it (addScopeHost) or a redirect lands us on it. Same-domain URLs
     // for hosts not yet proven in-scope wait in pendingHarvest, so a route referenced in rdex's bundle
@@ -428,17 +456,20 @@ export async function crawl(
         }
       }
     };
-    const collectLinks = async (): Promise<void> => {
+    const readLinks = async (): Promise<string[]> => {
       try {
         const r = await cdp!.send<any>("Runtime.evaluate", {
           expression:
             "JSON.stringify([...new Set([...document.querySelectorAll('a[href]')].map(a=>a.href))])",
           returnByValue: true,
         });
-        for (const h of JSON.parse(r.result?.value ?? "[]") as string[]) enqueue(h);
+        return JSON.parse(r.result?.value ?? "[]") as string[];
       } catch {
-        /* best effort */
+        return []; /* best effort */
       }
+    };
+    const collectLinks = async (): Promise<void> => {
+      for (const h of await readLinks()) enqueue(h);
     };
     const currentUrl = async (): Promise<string> => {
       try {
@@ -572,11 +603,22 @@ export async function crawl(
       if (Date.now() - lastNewJs > idleNoNewJsMs) break; // no new on-target artifact for the idle window
       if (Date.now() > hardDeadline) break; // safety ceiling
       if (pages >= maxPages) break;
-      const url = frontier.shift();
+      let url = frontier.shift();
       if (!url) {
-        if (inflight <= 0 && pendingSaves <= 0) break; // nothing queued, loading, or still being saved/harvested -> done
-        await delay(250);
-        continue;
+        // Main frontier exhausted. Wait only for JS bodies still being saved/harvested (they can queue more
+        // main-frontier URLs, which keeps the main walk's order), then fall back to the pages' own
+        // pre-click links. Do NOT wait for inflight here: chatty pages (portal polling, chat widgets)
+        // never reach inflight 0, so waiting on it would just run out the idle timer and stop the crawl.
+        if (pendingSaves > 0) {
+          await delay(250);
+          continue;
+        }
+        url = takeFallback();
+        if (!url) {
+          if (inflight <= 0) break; // nothing queued anywhere, nothing loading or being saved -> done
+          await delay(250);
+          continue;
+        }
       }
       if (visited.has(url)) continue;
       visited.add(url);
@@ -586,6 +628,15 @@ export async function crawl(
         await cdp.send("Page.navigate", { url });
         await waitIdle();
         noteLanding(await currentUrl()); // followed an HTTP/JS redirect? bring that same-domain landing host into scope
+        // Capture this page's inlines and READ its links BEFORE clicking. clickAll clicks anything with a
+        // pointer cursor, and one of those clicks can navigate the tab away. Sometimes the destination is
+        // the valuable path (MercadoLibre home -> registration, whose links lead to login/registration/b2b),
+        // sometimes a dead end (saudiacargo landing -> its PowerApps portal, after which the landing's own
+        // ~90 links were never queued and the crawl died at 2 pages). So the pre-click links go to the
+        // fallback frontier: the main frontier order stays exactly what it was (MELI walks the same pages
+        // in the same order) and the page's own links are walked once it runs dry instead of being lost.
+        await captureInline();
+        const preClickLinks = await readLinks();
         await clickAll();
         await waitIdle();
         await clickAll(); // second pass: click the buttons the first pass revealed (expanded menus, wizard steps)
@@ -593,6 +644,7 @@ export async function crawl(
         noteLanding(await currentUrl()); // a click may have redirected us cross-subdomain too
         await captureInline();
         await collectLinks();
+        for (const h of preClickLinks) enqueueFallback(h); // the page's own links, walked after the main frontier
       } catch {
         /* a bad page must not stop the crawl */
       }
