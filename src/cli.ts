@@ -1,5 +1,5 @@
 import type { AgentSpec } from "./config.ts";
-import { codexEffortConfig, deepseek } from "./config.ts";
+import { codexEffortConfig, deepseek, glm } from "./config.ts";
 import { log, warn } from "./log.ts";
 
 export interface CliResult {
@@ -99,14 +99,16 @@ export async function runClaude(
   return r;
 }
 
-// DeepSeek via the Claude Code CLI pointed at DeepSeek's Anthropic-compatible endpoint, so DeepSeek
-// runs AGENTIC (reusing the claude harness's tools) for both mining and hunting. We strip the Max
-// OAuth token and inject ANTHROPIC_BASE_URL + the DeepSeek key, so this claude process talks to
-// DeepSeek, not Anthropic. DeepSeek models default to "high" effort; the CLI has no effort flag here.
-export async function runDeepSeek(
+// Run a model through the Claude Code CLI pointed at a third-party Anthropic-compatible endpoint, so
+// that model runs AGENTIC (reusing the claude harness's tools) for mining and hunting. We strip the
+// Max OAuth token and inject ANTHROPIC_BASE_URL + the provider's key, so this claude process talks to
+// the provider, not Anthropic. Shared by DeepSeek and GLM; the CLI has no effort flag on this path.
+async function runAnthropicCompat(
   spec: AgentSpec,
   prompt: string,
   opts: { cwd: string; addDirs?: string[]; allowedTools?: string[]; timeoutMs?: number },
+  cfg: { apiKey: string; baseUrl: string },
+  label: string,
 ): Promise<CliResult> {
   const tools = opts.allowedTools ?? ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Task"];
   const args = ["claude", "-p", "--model", spec.model, "--output-format", "json", "--allowedTools", tools.join(" ")];
@@ -115,11 +117,30 @@ export async function runDeepSeek(
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined && k !== "CLAUDE_CODE_OAUTH_TOKEN") envFull[k] = v;
   }
-  envFull.ANTHROPIC_BASE_URL = deepseek.baseUrl;
-  envFull.ANTHROPIC_API_KEY = deepseek.apiKey;
-  envFull.ANTHROPIC_AUTH_TOKEN = deepseek.apiKey;
-  log(`[${spec.role}] claude(deepseek) model=${spec.model} cwd=${opts.cwd}`);
+  envFull.ANTHROPIC_BASE_URL = cfg.baseUrl;
+  envFull.ANTHROPIC_API_KEY = cfg.apiKey;
+  envFull.ANTHROPIC_AUTH_TOKEN = cfg.apiKey;
+  log(`[${spec.role}] claude(${label}) model=${spec.model} cwd=${opts.cwd}`);
   const r = await spawnCapture(args, { cwd: opts.cwd, stdin: prompt, timeoutMs: opts.timeoutMs, envFull });
-  if (r.timedOut) warn(`[${spec.role}] deepseek timed out`);
+  if (r.timedOut) warn(`[${spec.role}] ${label} timed out`);
   return r;
+}
+
+// DeepSeek via its Anthropic-compatible endpoint. DeepSeek models default to "high" effort.
+export function runDeepSeek(
+  spec: AgentSpec,
+  prompt: string,
+  opts: { cwd: string; addDirs?: string[]; allowedTools?: string[]; timeoutMs?: number },
+): Promise<CliResult> {
+  return runAnthropicCompat(spec, prompt, opts, deepseek, "deepseek");
+}
+
+// GLM (Zhipu / z.ai) via its Coding Plan Anthropic-compatible endpoint. GLM_API_KEY must be a Coding
+// Plan key (a general open-platform key returns 1113 "no resource package"); see config.ts.
+export function runGLM(
+  spec: AgentSpec,
+  prompt: string,
+  opts: { cwd: string; addDirs?: string[]; allowedTools?: string[]; timeoutMs?: number },
+): Promise<CliResult> {
+  return runAnthropicCompat(spec, prompt, opts, glm, "glm");
 }
