@@ -28,7 +28,7 @@ export async function runHunters(run: Run): Promise<number> {
   log(`[hunters] ${leadFiles.length} lead(s); escalation chain: ${chain.map(tagOf).join(" -> ")}`);
 
   const tasks = leadFiles.map((leadFile) => () => huntLeadEscalating(run, chain, leadFile, methodology));
-  await runLimited(tasks, Math.max(caps.claudeConcurrency, 1));
+  await runLimited(tasks, Math.max(caps.hunterConcurrency, 1)); // N leads in parallel; each lead escalates sequentially (early-exit)
 
   const confirmed = dedupeFindings(run);
   run.state.counts.findings = confirmed;

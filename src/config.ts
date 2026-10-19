@@ -80,6 +80,7 @@ export const agents = {
 export const caps = {
   claudeConcurrency: Number(process.env.CLAUDE_CONCURRENCY ?? 2),
   codexConcurrency: Number(process.env.CODEX_CONCURRENCY ?? 1),
+  hunterConcurrency: Number(process.env.HUNTER_CONCURRENCY ?? 3), // leads worked in parallel (each lead's model escalation stays sequential)
   subAgentsMax: Number(process.env.SUBAGENTS_MAX ?? 3),
 };
 
