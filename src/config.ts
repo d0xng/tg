@@ -55,7 +55,7 @@ export const agents = {
   hunters: [
     { role: "hunter-opus5",  provider: "claude", model: process.env.HUNTER1_MODEL ?? "claude-opus-5", effort: EFFORT },
     { role: "hunter-opus48", provider: "claude", model: process.env.HUNTER2_MODEL ?? "claude-opus-4-8", effort: EFFORT },
-    { role: "hunter-deepseek", provider: "deepseek", model: process.env.HUNTER3_MODEL ?? "deepseek-flash", effort: "high" }, // replaces opus-4.6
+    { role: "hunter-opus46", provider: "claude", model: process.env.HUNTER3_MODEL ?? "claude-opus-4-6", effort: EFFORT },
   ] as AgentSpec[],
   validator: {
     role: "validator",
