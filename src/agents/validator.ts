@@ -6,23 +6,73 @@ import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
 
+export interface ValidationResult {
+  valid: number;
+  invalid: number;
+  skipped: number;
+  total: number;
+}
+
+// Severity gate: the validator is an expensive clean-session re-verification, so we do NOT spend it on
+// low/info findings -- except open redirect, the one low class worth reporting. By the time a finding
+// exists the hunter has already PROVEN impact, so its `severity:` is reliable (not a guess). We fail
+// OPEN: a finding with a missing/ambiguous severity is validated anyway, so a mislabel never silently
+// drops a real bug. Skipped findings stay on disk with a SKIPPED verdict; the reporter only ships VALID.
+function severityOf(content: string): string {
+  const m = content.match(/^\s*severity:\s*["']?([a-z]+)/im);
+  return m ? m[1].toLowerCase() : "";
+}
+function isOpenRedirect(file: string, content: string): boolean {
+  return (
+    /redirect/i.test(file) ||
+    /open[-\s]?redirect/i.test(content) ||
+    /^\s*class:\s*[^\n]*redirect/im.test(content)
+  );
+}
+function shouldValidate(file: string, content: string): boolean {
+  const sev = severityOf(content);
+  if (sev === "medium" || sev === "high" || sev === "critical") return true;
+  if (isOpenRedirect(file, content)) return true; // the only low that pays
+  if (sev === "low" || sev === "info" || sev === "informational") return false;
+  return true; // unknown / ambiguous severity -> fail open (never silently drop)
+}
+
 // The validator: a clean-session agent (no stake, did not find the bug) that re-runs each finding's
 // PoC against the target itself, runs negative controls, and dictates a verdict + CVSS. Only findings
 // it independently reproduces ship. This is the gate that kills false positives.
-export async function runValidator(run: Run): Promise<{ valid: number; invalid: number; total: number }> {
+export async function runValidator(run: Run): Promise<ValidationResult> {
   const findings = run.listMd("findings");
   if (!findings.length) {
     log("[validator] no findings to validate");
-    return { valid: 0, invalid: 0, total: 0 };
+    return { valid: 0, invalid: 0, skipped: 0, total: 0 };
   }
   const vdir = join(run.dir, "verdicts");
   mkdirSync(vdir, { recursive: true });
   const methodology = readFileSync(join(PROMPTS_DIR, "validator.md"), "utf8");
   const spec = agents.validator;
-  log(`[validator] ${findings.length} findings in clean sessions (${spec.model})`);
-  jsonl(run.logFile, { stage: "validating", event: "validator:start", findings: findings.length });
 
-  const tasks = findings.map((f) => async () => {
+  // Severity gate: validate only medium+ (or open redirect); skip low/info to save budget.
+  const toValidate: string[] = [];
+  let skipped = 0;
+  for (const f of findings) {
+    const content = readFileSync(join(run.sub("findings"), f), "utf8");
+    if (shouldValidate(f, content)) {
+      toValidate.push(f);
+    } else {
+      skipped++;
+      const base = f.replace(/\.md$/, "");
+      writeFileSync(
+        join(vdir, base + ".md"),
+        `VERDICT: SKIPPED\nreason: low/info severity (not open-redirect), gated out of validation to save budget\nseverity: ${severityOf(content) || "unknown"}\n`,
+      );
+      jsonl(run.logFile, { stage: "validating", event: "validator:skipped", finding: f, severity: severityOf(content) });
+    }
+  }
+
+  log(`[validator] ${toValidate.length} to validate, ${skipped} skipped (low/info) of ${findings.length} (${spec.model})`);
+  jsonl(run.logFile, { stage: "validating", event: "validator:start", toValidate: toValidate.length, skipped });
+
+  const tasks = toValidate.map((f) => async () => {
     const base = f.replace(/\.md$/, "");
     const content = readFileSync(join(run.sub("findings"), f), "utf8");
     const prompt = [
@@ -53,14 +103,14 @@ export async function runValidator(run: Run): Promise<{ valid: number; invalid: 
 
   let valid = 0;
   let invalid = 0;
-  for (const f of findings) {
+  for (const f of toValidate) {
     const vf = join(vdir, f.replace(/\.md$/, "") + ".md");
     const v = existsSync(vf) ? readFileSync(vf, "utf8") : "";
     if (/VERDICT:\s*VALID/i.test(v)) valid++;
     else invalid++;
   }
   run.save();
-  log(`[validator] done: ${valid} VALID, ${invalid} not-valid / ${findings.length}`);
-  jsonl(run.logFile, { stage: "validating", event: "validator:all-done", valid, invalid, total: findings.length });
-  return { valid, invalid, total: findings.length };
+  log(`[validator] done: ${valid} VALID, ${invalid} not-valid, ${skipped} skipped / ${findings.length}`);
+  jsonl(run.logFile, { stage: "validating", event: "validator:all-done", valid, invalid, skipped, total: findings.length });
+  return { valid, invalid, skipped, total: findings.length };
 }

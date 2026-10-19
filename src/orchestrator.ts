@@ -91,12 +91,12 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
 
     // Stage 4 - validator (clean-session re-verification + CVSS; kills false positives)
     run.setStage("validating");
-    const valid = await runValidator(run);
-    const dropped = findingFiles.length - valid;
+    const v = await runValidator(run);
+    const extra = v.skipped ? ` ${DOT} ${v.skipped} skipped (low/info)` : "";
     await notifyMd(
-      `*Validation done* ${EMDASH} ${dom()}\n${mdEscape(`${valid} confirmed ${DOT} ${dropped} dropped`)}`,
+      `*Validation done* ${EMDASH} ${dom()}\n${mdEscape(`${v.valid} confirmed ${DOT} ${v.invalid} dropped${extra}`)}`,
     );
-    if (valid === 0) {
+    if (v.valid === 0) {
       run.setStage("done");
       return;
     }
