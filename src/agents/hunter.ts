@@ -1,18 +1,17 @@
 import { join } from "path";
 import { readFileSync, writeFileSync, statSync, rmSync, existsSync } from "fs";
-import { agents, caps, PROMPTS_DIR, timeouts, type AgentSpec } from "../config.ts";
+import { agents, PROMPTS_DIR, timeouts, type AgentSpec } from "../config.ts";
 import { runClaude, runCodex, runDeepSeek, runGLM } from "../cli.ts";
-import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
 
-// The hunter stage works each lead through an ESCALATION CHAIN of models, cheapest/weakest first,
-// strongest last. The first model to confirm an end-to-end PoC wins and the lead stops there -- no
-// point spending a stronger model on an already-confirmed bug. A lead NO model has confirmed yet
-// escalates to the next model, so a lead opus-4-6 cannot crack still gets a shot from opus-4-8 and then
-// opus-5 (depth as always). Leads run in parallel (each its own sequential chain) under the claude
-// concurrency cap; the confirming model writes findings/<leadbase>__<tag>.md, which a dedup pass
-// canonicalizes to findings/<leadbase>.md with the confirming model recorded.
+// The hunter stage: each lead is worked by ONE hunter, in depth. Leads are dealt round-robin across the
+// roster (lead 0 -> hunter 0, lead 1 -> hunter 1, ...), and every hunter works its own share in its own
+// lane, so N hunters means N leads in flight at once, one per hunter. (The per-lead escalation chain,
+// where a lead walked through all three models in turn, was too slow on wall-clock and was dropped.)
+// Depth comes from the methodology prompt: the hunter exhausts every angle on its lead before giving
+// up. The hunter writes findings/<leadbase>__<tag>.md, which a dedup pass canonicalizes to
+// findings/<leadbase>.md with the confirming model recorded.
 
 const tagOf = (spec: AgentSpec): string => spec.role.replace(/^hunter-/, "");
 
@@ -23,12 +22,18 @@ export async function runHunters(run: Run): Promise<number> {
     return 0;
   }
   const methodology = readFileSync(join(PROMPTS_DIR, "hunter.md"), "utf8");
-  // weakest/cheapest -> strongest; the roster is defined strongest-first, so reverse it to escalate up.
-  const chain = [...agents.hunters].reverse();
-  log(`[hunters] ${leadFiles.length} lead(s); escalation chain: ${chain.map(tagOf).join(" -> ")}`);
+  const hunters = agents.hunters;
 
-  const tasks = leadFiles.map((leadFile) => () => huntLeadEscalating(run, chain, leadFile, methodology));
-  await runLimited(tasks, Math.max(caps.hunterConcurrency, 1)); // N leads in parallel; each lead escalates sequentially (early-exit)
+  // Deal leads round-robin, then run one sequential lane per hunter, all lanes in parallel.
+  const lanes = hunters.map((spec) => ({ spec, leads: [] as string[] }));
+  leadFiles.forEach((leadFile, i) => lanes[i % lanes.length].leads.push(leadFile));
+  log(`[hunters] ${leadFiles.length} lead(s) across ${hunters.length} hunters: ${lanes.map((l) => `${tagOf(l.spec)} x${l.leads.length}`).join(", ")}`);
+
+  await Promise.all(
+    lanes.map(async ({ spec, leads }) => {
+      for (const leadFile of leads) await huntLead(run, spec, leadFile, methodology);
+    }),
+  );
 
   const confirmed = dedupeFindings(run);
   run.state.counts.findings = confirmed;
@@ -37,33 +42,25 @@ export async function runHunters(run: Run): Promise<number> {
   return confirmed;
 }
 
-// One lead through the chain: stop at the first model that writes a finding for it.
-async function huntLeadEscalating(run: Run, chain: AgentSpec[], leadFile: string, methodology: string): Promise<void> {
+// One lead, one hunter: record which model confirmed it (or that it stayed a lead).
+async function huntLead(run: Run, spec: AgentSpec, leadFile: string, methodology: string): Promise<void> {
   const leadBase = leadFile.replace(/\.md$/, "");
-  const findingsDir = run.sub("findings");
-  const tried: string[] = [];
-  for (const spec of chain) {
-    const tag = tagOf(spec);
-    const outName = `${leadBase}__${tag}.md`;
-    await huntOneLead(run, spec, leadFile, methodology, outName);
-    const out = join(findingsDir, outName);
-    const confirmed = existsSync(out);
-    jsonl(run.logFile, { stage: "hunting", event: "lead:attempt", lead: leadBase, model: tag, confirmed });
-    if (confirmed) {
-      try {
-        let body = readFileSync(out, "utf8").trimEnd();
-        body += `\n\n---\nConfirmed by: ${tag}`;
-        if (tried.length) body += ` | no finding from: ${tried.join(", ")}`;
-        writeFileSync(out, body + "\n");
-      } catch {
-        /* ignore */
-      }
-      log(`[hunters] ${leadBase}: confirmed by ${tag}${tried.length ? ` (after ${tried.join(", ")} found nothing)` : ""}`);
-      return;
-    }
-    tried.push(tag);
+  const tag = tagOf(spec);
+  const outName = `${leadBase}__${tag}.md`;
+  await huntOneLead(run, spec, leadFile, methodology, outName);
+  const out = join(run.sub("findings"), outName);
+  const confirmed = existsSync(out);
+  jsonl(run.logFile, { stage: "hunting", event: "lead:attempt", lead: leadBase, model: tag, confirmed });
+  if (!confirmed) {
+    log(`[hunters] ${leadBase}: unconfirmed by ${tag}`);
+    return;
   }
-  log(`[hunters] ${leadBase}: unconfirmed by all (${tried.join(", ")})`);
+  try {
+    writeFileSync(out, readFileSync(out, "utf8").trimEnd() + `\n\n---\nConfirmed by: ${tag}\n`);
+  } catch {
+    /* ignore */
+  }
+  log(`[hunters] ${leadBase}: confirmed by ${tag}`);
 }
 
 async function huntOneLead(run: Run, spec: AgentSpec, leadFile: string, methodology: string, outName: string): Promise<void> {

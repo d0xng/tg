@@ -71,13 +71,11 @@ export const agents = {
     model: process.env.JS_MODEL ?? "deepseek-flash", // DeepSeek-V4.1-Flash, PRIMARY analyzer (1M ctx, no OpenAI cyber classifier)
     effort: "high",
   } as AgentSpec,
-  // Escalation chain (weakest-first after the reverse in hunter.ts): hunter3 -> hunter2 -> hunter1.
-  // The roster is model-id driven -- providerForModel routes each id, so a glm-* id runs on GLM's
-  // Coding Plan automatically. To put GLM in the two lower rungs once a Coding-Plan key is live (a
-  // general key 1113s), set HUNTER3_MODEL=glm-5.3-flash and HUNTER2_MODEL=glm-5.3 in .env and restart:
-  // that is the intended cheapest->strongest ladder glm-5.3-flash -> glm-5.3 -> claude-opus-5 (the plan's
-  // flagship is glm-5.3, its light model glm-5.3-flash; use plain ids, the "[1m]" alias is 1211 Unknown
-  // on --model). Defaults stay on opus so a run never silently hunts with two dead (1113) rungs first.
+  // Leads are dealt round-robin across these hunters, one lead per hunter, each hunter in its own
+  // parallel lane (see hunter.ts). The roster is model-id driven -- providerForModel routes each id, so a
+  // glm-* id runs on GLM's Coding Plan automatically: e.g. HUNTER2_MODEL=glm-5.3 HUNTER3_MODEL=glm-5.3-flash
+  // in .env, then restart. The key must be a Coding-Plan key (a general key 1113s); use plain ids, the
+  // "[1m]" alias is 1211 Unknown on --model. Defaults stay on opus.
   hunters: [
     { role: `hunter-${modelTag(process.env.HUNTER1_MODEL ?? "claude-opus-5")}`,  provider: providerForModel(process.env.HUNTER1_MODEL ?? "claude-opus-5"),  model: process.env.HUNTER1_MODEL ?? "claude-opus-5",  effort: EFFORT },
     { role: `hunter-${modelTag(process.env.HUNTER2_MODEL ?? "claude-opus-4-8")}`, provider: providerForModel(process.env.HUNTER2_MODEL ?? "claude-opus-4-8"), model: process.env.HUNTER2_MODEL ?? "claude-opus-4-8", effort: EFFORT },
@@ -106,7 +104,6 @@ export const agents = {
 export const caps = {
   claudeConcurrency: Number(process.env.CLAUDE_CONCURRENCY ?? 2),
   codexConcurrency: Number(process.env.CODEX_CONCURRENCY ?? 1),
-  hunterConcurrency: Number(process.env.HUNTER_CONCURRENCY ?? 3), // leads worked in parallel (each lead's model escalation stays sequential)
   subAgentsMax: Number(process.env.SUBAGENTS_MAX ?? 3),
 };
 
