@@ -13,6 +13,27 @@ import { runLimited } from "../util/pool.ts";
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Stealth: headless Chrome is trivially fingerprinted (the "HeadlessChrome" UA, navigator.webdriver,
+// no plugins/languages, missing window.chrome), and hardened targets serve a bot challenge or 0 JS to
+// it. We present a normal desktop Chrome UA and patch the obvious tells on every new document. Not a
+// full anti-detect suite, but it clears the cheap checks that otherwise return an empty page.
+const STEALTH_UA =
+  process.env.CRAWL_UA ??
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
+const STEALTH_JS = `
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+  try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
+  try { Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] }); } catch (e) {}
+  try { window.chrome = window.chrome || { runtime: {} }; } catch (e) {}
+  try {
+    const q = navigator.permissions && navigator.permissions.query;
+    if (q) navigator.permissions.query = (p) =>
+      p && p.name === 'notifications'
+        ? Promise.resolve({ state: (typeof Notification !== 'undefined' ? Notification.permission : 'default') })
+        : q(p);
+  } catch (e) {}
+`;
+
 interface CrawlOpts {
   idleNoNewJsMs?: number; // stop after this long with NO newly saved on-target artifact (default 60000)
   maxMs?: number; // hard safety ceiling so the crawl cannot run forever (default 3600000 = 60min)
@@ -146,10 +167,14 @@ async function launchChrome(): Promise<{ proc: Bun.Subprocess; port: number; pro
       `--remote-debugging-port=${port}`,
       "--remote-allow-origins=*", // required for CDP websocket on modern Chrome
       "--ignore-certificate-errors", // proceed past TLS cert mismatches (CNAME/SNI/Akamai) instead of stopping on Chrome's interstitial, so the actual site loads and its JS is captured
+      `--user-agent=${STEALTH_UA}`, // drop the "HeadlessChrome" tell from the UA
+      "--window-size=1920,1080",
+      "--lang=en-US,en",
       "--no-sandbox",
       "--disable-gpu",
       "--disable-dev-shm-usage",
       "--disable-background-networking",
+      "--disable-blink-features=AutomationControlled", // removes navigator.webdriver + automation flags
       "--no-first-run",
       "--no-default-browser-check",
       "--user-data-dir=" + profile,
@@ -191,23 +216,17 @@ export async function crawl(
   const targetHost = new URL(startUrl).hostname.toLowerCase();
   const baseDomain = targetHost.split(".").slice(-2).join(".");
   const allowHosts = (process.env.CRAWL_ALLOW_HOSTS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  // Capture JS only from the target's own domain (+ subdomains, + allowlisted CDNs). Third-party JS on
-  // other domains (widgets, libs, trackers) is off-target noise and dropped.
-  const onTarget = (u: string): boolean => {
-    try {
-      const h = new URL(u).hostname.toLowerCase();
-      return h === targetHost || h === baseDomain || h.endsWith("." + baseDomain) || allowHosts.some((a) => h === a || h.endsWith("." + a));
-    } catch {
-      return false;
-    }
-  };
+  // JS CAPTURE is host-agnostic: we save every script an in-scope page loads, wherever it is hosted
+  // (first-party CDNs like mlstatic.com / mlstatic, auth widgets, embedded apps on other domains),
+  // because entering the target IS the authorization and the page pulled that code in to run it. Only
+  // the analytics/tracker denylist is dropped. This is what fixes targets whose whole app ships from a
+  // separate CDN domain (e.g. MercadoLibre -> http2.mlstatic.com), which a same-domain filter zeroed out.
 
-  // Frontier scope = the start host PLUS any same-registrable-domain host we LAND on by following a
-  // redirect (HTTP or JS). So rdex.verisk.com -> gateway-login.verisk.com (the SSO) is followed and
-  // crawled; a footer link to a sibling marketing site is NOT crawled unless a redirect took us there;
-  // a redirect to a third-party IdP (a different registrable domain) is never added. JS capture stays
-  // registrable-domain (onTarget), so a dependency chunk hosted on a sibling subdomain is still saved
-  // even when we do not crawl that subdomain's pages.
+  // Frontier scope (which PAGES we navigate) stays narrow even though capture is wide: the start host
+  // PLUS any same-registrable-domain host we LAND on via a redirect (HTTP or JS) or whose first-party JS
+  // we load. So rdex.verisk.com -> gateway-login.verisk.com (the SSO) is walked; a footer link to a
+  // sibling marketing site is not; a redirect to a third-party IdP is never walked. We capture whatever
+  // loads, but only click through pages on the target's own domain tree.
   const scopeHosts = new Set<string>([targetHost, ...allowHosts]);
   const sameRegDomain = (h: string): boolean => h === baseDomain || h.endsWith("." + baseDomain);
   const inScopeHost = (h: string): boolean =>
@@ -261,6 +280,19 @@ export async function crawl(
     } catch {
       /* older Chrome without this command: the launch flag covers it */
     }
+    // Stealth: set a real desktop UA for every request (main doc + subresources) and patch the obvious
+    // headless tells before any page script runs, so bot-gated targets serve the real app, not a 0-JS
+    // challenge. Best-effort: if the commands are unavailable the crawl still proceeds.
+    try {
+      await cdp.send("Network.setUserAgentOverride", {
+        userAgent: STEALTH_UA,
+        acceptLanguage: "en-US,en;q=0.9",
+        platform: "Linux x86_64",
+      });
+      await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: STEALTH_JS });
+    } catch {
+      /* best effort */
+    }
 
     cdp.on("Network.requestWillBeSent", () => {
       inflight++;
@@ -277,7 +309,7 @@ export async function crawl(
     cdp.on("Network.loadingFinished", (p: any) => {
       done();
       const meta = respMeta.get(p.requestId);
-      if (meta && isJs(meta.url, meta.mime) && !savedUrls.has(meta.url) && onTarget(meta.url) && !isDeniedHost(meta.url)) {
+      if (meta && isJs(meta.url, meta.mime) && !savedUrls.has(meta.url) && !isDeniedHost(meta.url)) {
         savedUrls.add(meta.url);
         markNewJs();
         pendingSaves++;
@@ -490,7 +522,7 @@ export async function crawl(
       return [...out];
     };
     const fetchAndSaveChunk = async (url: string): Promise<boolean> => {
-      if (savedUrls.has(url) || !onTarget(url) || isDeniedHost(url)) return false;
+      if (savedUrls.has(url) || isDeniedHost(url)) return false;
       try {
         const res = await fetch(url, { tls: { rejectUnauthorized: false }, redirect: "follow" } as any);
         if (!res.ok) return false;
@@ -521,7 +553,7 @@ export async function crawl(
             for (const abs of resolveChunk(val, u)) candidates.add(abs);
           }
         }
-        const todo = [...candidates].filter((u) => !savedUrls.has(u) && onTarget(u) && !isDeniedHost(u));
+        const todo = [...candidates].filter((u) => !savedUrls.has(u) && !isDeniedHost(u));
         if (!todo.length) break;
         let roundNew = 0;
         const tasks = todo.map((u) => async () => {
