@@ -1,7 +1,7 @@
 import { join } from "path";
 import { readFileSync, writeFileSync, statSync, rmSync, existsSync } from "fs";
 import { agents, caps, PROMPTS_DIR, timeouts, type AgentSpec } from "../config.ts";
-import { runClaude, runCodex } from "../cli.ts";
+import { runClaude, runCodex, runDeepSeek } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
@@ -88,14 +88,16 @@ async function huntOneLead(run: Run, spec: AgentSpec, leadFile: string, methodol
   jsonl(run.logFile, { stage: "hunting", event: "hunter:start", hunter: spec.role, lead: leadFile });
   try {
     const res =
-      spec.provider === "claude"
-        ? await runClaude(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.hunterMs })
-        : await runCodex(spec, prompt, {
-            cwd: run.dir,
-            sandbox: "workspace-write", // network enabled per codex config; writes stay in the workspace
-            outFile: join(run.sub("logs"), `hunter-${spec.role}-${leadFile}.last.txt`),
-            timeoutMs: timeouts.hunterMs,
-          });
+      spec.provider === "deepseek"
+        ? await runDeepSeek(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.hunterMs })
+        : spec.provider === "claude"
+          ? await runClaude(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.hunterMs })
+          : await runCodex(spec, prompt, {
+              cwd: run.dir,
+              sandbox: "workspace-write", // network enabled per codex config; writes stay in the workspace
+              outFile: join(run.sub("logs"), `hunter-${spec.role}-${leadFile}.last.txt`),
+              timeoutMs: timeouts.hunterMs,
+            });
     writeFileSync(
       join(run.sub("logs"), `hunter-${spec.role}-${leadFile}.out.log`),
       `exit=${res.code} timedOut=${res.timedOut}\n==STDOUT==\n${res.stdout}\n==STDERR==\n${res.stderr}\n`,

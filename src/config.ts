@@ -5,7 +5,7 @@ export const ROOT = join(import.meta.dir, "..");
 export const RUNS_DIR = process.env.HUNTLINE_RUNS ?? join(ROOT, "runs");
 export const PROMPTS_DIR = join(ROOT, "prompts");
 
-export type Provider = "codex" | "claude";
+export type Provider = "codex" | "claude" | "deepseek";
 export type Effort = "low" | "medium" | "high" | "xhigh";
 
 export interface AgentSpec {
@@ -31,17 +31,31 @@ export const chrome = {
 export const codexEffortConfig =
   process.env.CODEX_EFFORT_CONFIG ?? `model_reasoning_effort="${EFFORT}"`;
 
+// DeepSeek via its Anthropic-compatible endpoint, driven agentically through the Claude Code CLI.
+export const deepseek = {
+  apiKey: process.env.DEEPSEEK_API_KEY ?? "",
+  baseUrl: process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com/anthropic",
+};
+
+// Map a model id to the CLI that runs it: deepseek-* via the claude CLI pointed at DeepSeek, gpt-*
+// via codex, everything else (claude-*) via the claude CLI with the Max subscription.
+export function providerForModel(model: string): Provider {
+  if (model.startsWith("deepseek")) return "deepseek";
+  if (model.startsWith("gpt")) return "codex";
+  return "claude";
+}
+
 export const agents = {
   jsAnalyzer: {
     role: "js-analyzer",
-    provider: "codex",
-    model: process.env.JS_MODEL ?? "gpt-5.6-sol", // d0x's codex default (the 5.6 "-sol" variant; 6-sol trips the cyber classifier more)
-    effort: EFFORT,
+    provider: "deepseek",
+    model: process.env.JS_MODEL ?? "deepseek-flash", // DeepSeek-V4.1-Flash, PRIMARY analyzer (1M ctx, no OpenAI cyber classifier)
+    effort: "high",
   } as AgentSpec,
   hunters: [
     { role: "hunter-opus5",  provider: "claude", model: process.env.HUNTER1_MODEL ?? "claude-opus-5", effort: EFFORT },
     { role: "hunter-opus48", provider: "claude", model: process.env.HUNTER2_MODEL ?? "claude-opus-4-8", effort: EFFORT },
-    { role: "hunter-opus46", provider: "claude", model: process.env.HUNTER3_MODEL ?? "claude-opus-4-6", effort: EFFORT },
+    { role: "hunter-deepseek", provider: "deepseek", model: process.env.HUNTER3_MODEL ?? "deepseek-flash", effort: "high" }, // replaces opus-4.6
   ] as AgentSpec[],
   validator: {
     role: "validator",

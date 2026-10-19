@@ -1,5 +1,5 @@
 import type { AgentSpec } from "./config.ts";
-import { codexEffortConfig } from "./config.ts";
+import { codexEffortConfig, deepseek } from "./config.ts";
 import { log, warn } from "./log.ts";
 
 export interface CliResult {
@@ -13,14 +13,15 @@ export interface CliResult {
 // their answer over stdout anyway (they write artifacts to the run dir); stdout is only for logs.
 export async function spawnCapture(
   cmd: string[],
-  opts: { cwd?: string; stdin?: string; timeoutMs?: number; env?: Record<string, string> } = {},
+  opts: { cwd?: string; stdin?: string; timeoutMs?: number; env?: Record<string, string>; envFull?: Record<string, string> } = {},
 ): Promise<CliResult> {
   const proc = Bun.spawn(cmd, {
     cwd: opts.cwd,
     stdin: opts.stdin ? new TextEncoder().encode(opts.stdin) : "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, ...(opts.env ?? {}) },
+    // envFull replaces the environment entirely (used to strip the Max OAuth token for DeepSeek); env merges.
+    env: opts.envFull ?? { ...process.env, ...(opts.env ?? {}) },
   });
 
   let timedOut = false;
@@ -95,5 +96,30 @@ export async function runClaude(
   log(`[${spec.role}] claude -p model=${spec.model} cwd=${opts.cwd}`);
   const r = await spawnCapture(args, { cwd: opts.cwd, stdin: prompt, timeoutMs: opts.timeoutMs });
   if (r.timedOut) warn(`[${spec.role}] claude timed out`);
+  return r;
+}
+
+// DeepSeek via the Claude Code CLI pointed at DeepSeek's Anthropic-compatible endpoint, so DeepSeek
+// runs AGENTIC (reusing the claude harness's tools) for both mining and hunting. We strip the Max
+// OAuth token and inject ANTHROPIC_BASE_URL + the DeepSeek key, so this claude process talks to
+// DeepSeek, not Anthropic. DeepSeek models default to "high" effort; the CLI has no effort flag here.
+export async function runDeepSeek(
+  spec: AgentSpec,
+  prompt: string,
+  opts: { cwd: string; addDirs?: string[]; allowedTools?: string[]; timeoutMs?: number },
+): Promise<CliResult> {
+  const tools = opts.allowedTools ?? ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Task"];
+  const args = ["claude", "-p", "--model", spec.model, "--output-format", "json", "--allowedTools", tools.join(" ")];
+  for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
+  const envFull: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && k !== "CLAUDE_CODE_OAUTH_TOKEN") envFull[k] = v;
+  }
+  envFull.ANTHROPIC_BASE_URL = deepseek.baseUrl;
+  envFull.ANTHROPIC_API_KEY = deepseek.apiKey;
+  envFull.ANTHROPIC_AUTH_TOKEN = deepseek.apiKey;
+  log(`[${spec.role}] claude(deepseek) model=${spec.model} cwd=${opts.cwd}`);
+  const r = await spawnCapture(args, { cwd: opts.cwd, stdin: prompt, timeoutMs: opts.timeoutMs, envFull });
+  if (r.timedOut) warn(`[${spec.role}] deepseek timed out`);
   return r;
 }

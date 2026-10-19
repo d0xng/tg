@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
-import { agents, PROMPTS_DIR, timeouts, type AgentSpec } from "../config.ts";
-import { runCodex, runClaude } from "../cli.ts";
+import { agents, PROMPTS_DIR, timeouts, providerForModel, type AgentSpec } from "../config.ts";
+import { runCodex, runClaude, runDeepSeek } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
@@ -30,7 +30,7 @@ function chunk<T>(a: T[], n: number): T[][] {
 function minerModelChain(): string[] {
   const env = process.env.MINER_MODEL_CHAIN;
   if (env) return env.split(",").map((s) => s.trim()).filter(Boolean);
-  const ALLOWED = ["gpt-5.6-sol", "gpt-6-sol", "claude-opus-4-6"];
+  const ALLOWED = ["deepseek-flash", "gpt-5.6-sol", "gpt-6-sol", "claude-opus-4-6"];
   const first = agents.jsAnalyzer.model;
   return [first, ...ALLOWED.filter((m) => m !== first)];
 }
@@ -59,21 +59,19 @@ export async function runJsMiners(
     let used = "";
     for (let a = 0; a < chain.length; a++) {
       const model = chain[a];
-      const provider: "codex" | "claude" = model.startsWith("claude") ? "claude" : "codex";
+      const provider = providerForModel(model);
       const spec: AgentSpec = { ...agents.jsAnalyzer, provider, model };
       res =
-        provider === "claude"
-          ? await runClaude(spec, prompt, {
-              cwd: run.dir,
-              addDirs: ["/opt/huntline/skills"],
-              timeoutMs: timeouts.jsAnalyzerMs,
-            })
-          : await runCodex(spec, prompt, {
-              cwd: run.dir,
-              sandbox: "workspace-write",
-              outFile: join(run.sub("logs"), `miner-${i}.out.txt`),
-              timeoutMs: timeouts.jsAnalyzerMs,
-            });
+        provider === "deepseek"
+          ? await runDeepSeek(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.jsAnalyzerMs })
+          : provider === "claude"
+            ? await runClaude(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.jsAnalyzerMs })
+            : await runCodex(spec, prompt, {
+                cwd: run.dir,
+                sandbox: "workspace-write",
+                outFile: join(run.sub("logs"), `miner-${i}.out.txt`),
+                timeoutMs: timeouts.jsAnalyzerMs,
+              });
       used = model;
       writeFileSync(
         join(run.sub("logs"), `miner-${i}.${model}.log`),
