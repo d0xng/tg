@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { agents, PROMPTS_DIR, timeouts, type AgentSpec } from "../config.ts";
-import { runCodex } from "../cli.ts";
+import { runCodex, runClaude } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
@@ -21,12 +21,16 @@ function chunk<T>(a: T[], n: number): T[][] {
   return out;
 }
 
-// Prefer the configured analyzer model, then fall back to the other allowed model. Only gpt-5.6-sol and
-// gpt-6-sol are used (default 5.6 -> 6). Override with MINER_MODEL_CHAIN (comma-separated) if needed.
+// Prefer the configured analyzer model, then fall back DOWN a chain that ends in a claude miner.
+// gpt-5.6-sol -> gpt-6-sol covers model "at capacity" (model-specific). claude-opus-4-6 last covers
+// the codex cyber classifier, which is CONTENT-triggered and so flags the lead on every GPT model;
+// claude does not self-censor exploit analysis, so it reads the exploit-heavy slice a codex model
+// cannot. Override the whole chain with MINER_MODEL_CHAIN (comma-separated). A "gpt-*" entry runs via
+// codex, a "claude-*" entry via claude.
 function minerModelChain(): string[] {
   const env = process.env.MINER_MODEL_CHAIN;
   if (env) return env.split(",").map((s) => s.trim()).filter(Boolean);
-  const ALLOWED = ["gpt-5.6-sol", "gpt-6-sol"];
+  const ALLOWED = ["gpt-5.6-sol", "gpt-6-sol", "claude-opus-4-6"];
   const first = agents.jsAnalyzer.model;
   return [first, ...ALLOWED.filter((m) => m !== first)];
 }
@@ -55,13 +59,21 @@ export async function runJsMiners(
     let used = "";
     for (let a = 0; a < chain.length; a++) {
       const model = chain[a];
-      const spec: AgentSpec = { ...agents.jsAnalyzer, model };
-      res = await runCodex(spec, prompt, {
-        cwd: run.dir,
-        sandbox: "workspace-write",
-        outFile: join(run.sub("logs"), `miner-${i}.out.txt`),
-        timeoutMs: timeouts.jsAnalyzerMs,
-      });
+      const provider: "codex" | "claude" = model.startsWith("claude") ? "claude" : "codex";
+      const spec: AgentSpec = { ...agents.jsAnalyzer, provider, model };
+      res =
+        provider === "claude"
+          ? await runClaude(spec, prompt, {
+              cwd: run.dir,
+              addDirs: ["/opt/huntline/skills"],
+              timeoutMs: timeouts.jsAnalyzerMs,
+            })
+          : await runCodex(spec, prompt, {
+              cwd: run.dir,
+              sandbox: "workspace-write",
+              outFile: join(run.sub("logs"), `miner-${i}.out.txt`),
+              timeoutMs: timeouts.jsAnalyzerMs,
+            });
       used = model;
       writeFileSync(
         join(run.sub("logs"), `miner-${i}.${model}.log`),
