@@ -144,3 +144,23 @@ export function runGLM(
 ): Promise<CliResult> {
   return runAnthropicCompat(spec, prompt, opts, glm, "glm");
 }
+
+// One entry point for every stage: the CLI is picked from the spec's provider, which config.ts derives
+// from the model id (claude-* -> Max subscription, glm-* -> GLM Coding Plan, deepseek-* -> DeepSeek, gpt-*
+// -> codex). Codex gets the workspace-write sandbox (network per codex config) and, optionally, -o outFile.
+export function runAgent(
+  spec: AgentSpec,
+  prompt: string,
+  opts: { cwd: string; addDirs?: string[]; allowedTools?: string[]; timeoutMs?: number; outFile?: string },
+): Promise<CliResult> {
+  switch (spec.provider) {
+    case "glm":
+      return runGLM(spec, prompt, opts);
+    case "deepseek":
+      return runDeepSeek(spec, prompt, opts);
+    case "codex":
+      return runCodex(spec, prompt, { cwd: opts.cwd, sandbox: "workspace-write", outFile: opts.outFile, timeoutMs: opts.timeoutMs });
+    default:
+      return runClaude(spec, prompt, opts);
+  }
+}

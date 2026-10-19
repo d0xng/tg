@@ -81,21 +81,23 @@ export const agents = {
     { role: `hunter-${modelTag(process.env.HUNTER2_MODEL ?? "claude-opus-4-8")}`, provider: providerForModel(process.env.HUNTER2_MODEL ?? "claude-opus-4-8"), model: process.env.HUNTER2_MODEL ?? "claude-opus-4-8", effort: EFFORT },
     { role: `hunter-${modelTag(process.env.HUNTER3_MODEL ?? "claude-opus-4-6")}`, provider: providerForModel(process.env.HUNTER3_MODEL ?? "claude-opus-4-6"), model: process.env.HUNTER3_MODEL ?? "claude-opus-4-6", effort: EFFORT },
   ] as AgentSpec[],
+  // validator/reporter/recon: like the hunters, the provider follows the model id, so e.g.
+  // VALIDATOR_MODEL=glm-5.3-flash in .env runs it on GLM. Defaults stay on opus.
   validator: {
     role: "validator",
-    provider: "claude",
+    provider: providerForModel(process.env.VALIDATOR_MODEL ?? "claude-opus-4-8"),
     model: process.env.VALIDATOR_MODEL ?? "claude-opus-4-8",
     effort: EFFORT,
   } as AgentSpec,
   reporter: {
     role: "reporter",
-    provider: "claude",
+    provider: providerForModel(process.env.REPORTER_MODEL ?? "claude-opus-4-6"),
     model: process.env.REPORTER_MODEL ?? "claude-opus-4-6",
     effort: EFFORT,
   } as AgentSpec,
   recon: {
     role: "recon",
-    provider: "claude",
+    provider: providerForModel(process.env.RECON_MODEL ?? "claude-opus-4-6"),
     model: process.env.RECON_MODEL ?? "claude-opus-4-6", // conversational front desk; override to a lighter model to cut chat cost
     effort: EFFORT,
   } as AgentSpec,

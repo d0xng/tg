@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
 import { agents, caps, PROMPTS_DIR, timeouts } from "../config.ts";
-import { runClaude } from "../cli.ts";
+import { runAgent } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
@@ -89,7 +89,7 @@ export async function runValidator(run: Run): Promise<ValidationResult> {
       content,
     ].join("\n");
     try {
-      const res = await runClaude(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.hunterMs });
+      const res = await runAgent(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.hunterMs });
       writeFileSync(
         join(run.sub("logs"), `validator-${f}.out.log`),
         `exit=${res.code} timedOut=${res.timedOut}\n==STDOUT==\n${res.stdout}\n==STDERR==\n${res.stderr}\n`,

@@ -1,7 +1,7 @@
 import { readFileSync } from "fs";
 import { join } from "path";
 import { agents, PROMPTS_DIR } from "../config.ts";
-import { runClaude } from "../cli.ts";
+import { runAgent } from "../cli.ts";
 import { notify } from "../telegram.ts";
 import { expandScope } from "../recon/expand.ts";
 import { Run } from "../run.ts";
@@ -39,7 +39,7 @@ export async function handleMessage(text: string, chatId: number): Promise<void>
 
   let reply = "";
   try {
-    const res = await runClaude(agents.recon, prompt, {
+    const res = await runAgent(agents.recon, prompt, {
       cwd: "/tmp",
       allowedTools: ["Read"],
       timeoutMs: 120_000,

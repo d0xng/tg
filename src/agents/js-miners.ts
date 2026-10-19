@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { agents, PROMPTS_DIR, timeouts, providerForModel, type AgentSpec } from "../config.ts";
-import { runCodex, runClaude, runDeepSeek } from "../cli.ts";
+import { runAgent, type CliResult } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
@@ -25,8 +25,8 @@ function chunk<T>(a: T[], n: number): T[][] {
 // gpt-5.6-sol -> gpt-6-sol covers model "at capacity" (model-specific). claude-opus-4-6 last covers
 // the codex cyber classifier, which is CONTENT-triggered and so flags the lead on every GPT model;
 // claude does not self-censor exploit analysis, so it reads the exploit-heavy slice a codex model
-// cannot. Override the whole chain with MINER_MODEL_CHAIN (comma-separated). A "gpt-*" entry runs via
-// codex, a "claude-*" entry via claude.
+// cannot. Override the whole chain with MINER_MODEL_CHAIN (comma-separated). Each entry runs on the CLI its
+// model id maps to (gpt-* -> codex, claude-* -> claude, glm-* -> GLM, deepseek-* -> DeepSeek; see runAgent).
 function minerModelChain(): string[] {
   const env = process.env.MINER_MODEL_CHAIN;
   if (env) return env.split(",").map((s) => s.trim()).filter(Boolean);
@@ -55,23 +55,18 @@ export async function runJsMiners(
 
   const tasks = slices.map((slice, i) => async () => {
     const prompt = buildMinerPrompt(run, i, slice, methodology);
-    let res: Awaited<ReturnType<typeof runCodex>> | null = null;
+    let res: CliResult | null = null;
     let used = "";
     for (let a = 0; a < chain.length; a++) {
       const model = chain[a];
       const provider = providerForModel(model);
       const spec: AgentSpec = { ...agents.jsAnalyzer, provider, model };
-      res =
-        provider === "deepseek"
-          ? await runDeepSeek(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.jsAnalyzerMs })
-          : provider === "claude"
-            ? await runClaude(spec, prompt, { cwd: run.dir, addDirs: ["/opt/huntline/skills"], timeoutMs: timeouts.jsAnalyzerMs })
-            : await runCodex(spec, prompt, {
-                cwd: run.dir,
-                sandbox: "workspace-write",
-                outFile: join(run.sub("logs"), `miner-${i}.out.txt`),
-                timeoutMs: timeouts.jsAnalyzerMs,
-              });
+      res = await runAgent(spec, prompt, {
+        cwd: run.dir,
+        addDirs: ["/opt/huntline/skills"],
+        timeoutMs: timeouts.jsAnalyzerMs,
+        outFile: join(run.sub("logs"), `miner-${i}.out.txt`), // codex only
+      });
       used = model;
       writeFileSync(
         join(run.sub("logs"), `miner-${i}.${model}.log`),
