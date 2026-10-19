@@ -55,6 +55,12 @@ export const agents = {
     model: process.env.REPORTER_MODEL ?? "claude-opus-4-6",
     effort: EFFORT,
   } as AgentSpec,
+  recon: {
+    role: "recon",
+    provider: "claude",
+    model: process.env.RECON_MODEL ?? "claude-opus-4-6", // conversational front desk; override to a lighter model to cut chat cost
+    effort: EFFORT,
+  } as AgentSpec,
 };
 
 export const caps = {

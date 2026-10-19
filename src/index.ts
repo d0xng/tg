@@ -1,17 +1,13 @@
 import { pollUpdates } from "./telegram.ts";
-import { Run } from "./run.ts";
-import { orchestrate } from "./orchestrator.ts";
+import { handleMessage } from "./agents/recon.ts";
 import { log } from "./log.ts";
 
-// Telegram-driven entry: send the bot a domain + scope and it runs the pipeline, then pings back
-// "N leads" and (Phase 2) "N findings + types". One run at a time for now.
+// Telegram-driven entry: long-poll messages and route each to the recon agent, which chats, settles a
+// scope, expands wildcards (subfinder | httpx), and runs each host end to end through orchestrate(),
+// reporting back to Telegram at every phase. One run at a time.
 async function main() {
-  log("huntline serve: starting Telegram ingress");
-  await pollUpdates(async (req) => {
-    const run = Run.create(req.domain, req.scope);
-    log(`run created from telegram: ${run.state.id}`);
-    await orchestrate(run);
-  });
+  log("huntline serve: Telegram recon ingress starting");
+  await pollUpdates(handleMessage);
 }
 
 main();
