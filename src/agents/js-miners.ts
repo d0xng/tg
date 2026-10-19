@@ -1,6 +1,6 @@
-import { readdirSync, readFileSync } from "fs";
+import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
-import { agents, PROMPTS_DIR, timeouts } from "../config.ts";
+import { agents, PROMPTS_DIR, timeouts, type AgentSpec } from "../config.ts";
 import { runCodex } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
@@ -10,11 +10,25 @@ import type { Run } from "../run.ts";
 // reader that reads ONLY its slice (file by file, in full, never grep) and writes leads straight to
 // leads/ the moment it finds a primitive. This is what makes 100% coverage of a big corpus feasible:
 // one session cannot read hundreds of files, but many parallel miners each reading ~25 can.
+//
+// A miner that fails (codex exits non-zero: "Selected model is at capacity", the cyber classifier
+// "flagged", a timeout) is RETRIED automatically on the next model in the chain, so a slice is never
+// lost to one model's availability. Each attempt's stderr is captured for diagnosis.
 
 function chunk<T>(a: T[], n: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < a.length; i += n) out.push(a.slice(i, i + n));
   return out;
+}
+
+// Prefer the configured analyzer model, then fall back to the other allowed model. Only gpt-5.6-sol and
+// gpt-6-sol are used (default 5.6 -> 6). Override with MINER_MODEL_CHAIN (comma-separated) if needed.
+function minerModelChain(): string[] {
+  const env = process.env.MINER_MODEL_CHAIN;
+  if (env) return env.split(",").map((s) => s.trim()).filter(Boolean);
+  const ALLOWED = ["gpt-5.6-sol", "gpt-6-sol"];
+  const first = agents.jsAnalyzer.model;
+  return [first, ...ALLOWED.filter((m) => m !== first)];
 }
 
 export async function runJsMiners(
@@ -27,21 +41,42 @@ export async function runJsMiners(
   const files = readdirSync(jsDir).filter((f) => /\.(m?js)$/i.test(f)); // chunks + inline; .map handled separately
   const slices = chunk(files, sliceSize);
   const methodology = readFileSync(join(PROMPTS_DIR, "js-analyzer.md"), "utf8");
+  const chain = minerModelChain();
 
-  log(`[js-miners] ${files.length} files -> ${slices.length} miners x ~${sliceSize} files, ${concurrency} parallel`);
-  jsonl(run.logFile, { stage: "analyzing", event: "miners:start", files: files.length, miners: slices.length, concurrency });
+  log(
+    `[js-miners] ${files.length} files -> ${slices.length} miners x ~${sliceSize} files, ${concurrency} parallel; model chain: ${chain.join(" -> ")}`,
+  );
+  jsonl(run.logFile, { stage: "analyzing", event: "miners:start", files: files.length, miners: slices.length, concurrency, chain });
   const t0 = Date.now();
 
   const tasks = slices.map((slice, i) => async () => {
     const prompt = buildMinerPrompt(run, i, slice, methodology);
-    const res = await runCodex(agents.jsAnalyzer, prompt, {
-      cwd: run.dir,
-      sandbox: "workspace-write",
-      outFile: join(run.sub("logs"), `miner-${i}.out.txt`),
-      timeoutMs: timeouts.jsAnalyzerMs,
-    });
-    jsonl(run.logFile, { stage: "analyzing", event: "miner:done", miner: i, exit: res.code, timedOut: res.timedOut, files: slice.length });
-    if (res.code !== 0) warn(`[js-miners] miner ${i} exit ${res.code} (${slice.length} files)`);
+    let res: Awaited<ReturnType<typeof runCodex>> | null = null;
+    let used = "";
+    for (let a = 0; a < chain.length; a++) {
+      const model = chain[a];
+      const spec: AgentSpec = { ...agents.jsAnalyzer, model };
+      res = await runCodex(spec, prompt, {
+        cwd: run.dir,
+        sandbox: "workspace-write",
+        outFile: join(run.sub("logs"), `miner-${i}.out.txt`),
+        timeoutMs: timeouts.jsAnalyzerMs,
+      });
+      used = model;
+      writeFileSync(
+        join(run.sub("logs"), `miner-${i}.${model}.log`),
+        `exit=${res.code} timedOut=${res.timedOut}\n==STDERR (tail)==\n${(res.stderr ?? "").slice(-4000)}\n`,
+      );
+      if (res.code === 0 && !res.timedOut) break; // success -> stop retrying
+      const next = a + 1 < chain.length ? chain[a + 1] : null;
+      warn(
+        `[js-miners] miner ${i} failed on ${model} (exit ${res.code}${res.timedOut ? " timeout" : ""})` +
+          (next ? ` -> retry on ${next}` : " -> chain exhausted"),
+      );
+      jsonl(run.logFile, { stage: "analyzing", event: "miner:retry", miner: i, model, exit: res.code, timedOut: res.timedOut, next });
+    }
+    jsonl(run.logFile, { stage: "analyzing", event: "miner:done", miner: i, exit: res?.code ?? -1, model: used, files: slice.length });
+    if (!res || res.code !== 0) warn(`[js-miners] miner ${i} exhausted model chain (${slice.length} files)`);
   });
   await runLimited(tasks, concurrency);
 
