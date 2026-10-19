@@ -1,13 +1,15 @@
 import { crawl } from "./agents/browser-operator.ts";
-import { runJsAnalyzer } from "./agents/js-analyzer.ts";
+import { runJsMiners } from "./agents/js-miners.ts";
 import { runHunters } from "./agents/hunter.ts";
 import { notify } from "./telegram.ts";
 import { jsonl, log, err as logErr } from "./log.ts";
 import { timeouts } from "./config.ts";
 import { Run } from "./run.ts";
 
-// The orchestrator sequences the assembly line for one run. Phase 1 wired here: crawl -> js-analyzer
+// The orchestrator sequences the assembly line for one run. Phase 1 wired here: crawl -> js-miners
 // -> notify "N leads". Phase 2 appends: hunters -> validator -> reporter -> notify "N findings + types".
+// The one-shot path uses the SAME parallel js-miners as the manual analyze-run, so a single `hunt`
+// command is as thorough as running the stages by hand (not the old single-session js-analyzer).
 // The funnel is a filing cabinet, not a set of approval gates: each stage writes its directory and
 // the next stage reads it. Nothing waits on a human except the two pull-notifications.
 
@@ -36,9 +38,9 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
       return;
     }
 
-    // Stage 2 — js-analyzer (read, emit leads)
+    // Stage 2 — js-miners (parallel readers, each reads its slice in full, emit leads)
     run.setStage("analyzing");
-    const leads = await runJsAnalyzer(run);
+    const leads = await runJsMiners(run);
     await notify(`leads ready on ${run.state.domain}: ${leads} lead${leads === 1 ? "" : "s"} (run ${run.state.id})`);
 
     if (leads === 0) {

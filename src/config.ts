@@ -35,7 +35,7 @@ export const agents = {
   jsAnalyzer: {
     role: "js-analyzer",
     provider: "codex",
-    model: process.env.JS_MODEL ?? "gpt-6-sol", // d0x's codex default (the "-sol" variant he meant)
+    model: process.env.JS_MODEL ?? "gpt-5.6-sol", // d0x's codex default (the 5.6 "-sol" variant; 6-sol trips the cyber classifier more)
     effort: EFFORT,
   } as AgentSpec,
   hunters: [
