@@ -8,3 +8,4 @@ _test-js/
 /tmp
 bun.lock
 rerun-miner.ts
+.telegram-offset

@@ -1,4 +1,6 @@
-import { telegram } from "./config.ts";
+import { readFileSync, writeFileSync } from "fs";
+import { join } from "path";
+import { telegram, RUNS_DIR } from "./config.ts";
 import { log, warn } from "./log.ts";
 
 const api = (method: string) => `https://api.telegram.org/bot${telegram.token}/${method}`;
@@ -93,14 +95,26 @@ export async function pollUpdates(onMessage: (text: string, chatId: number) => P
     warn("TELEGRAM_BOT_TOKEN not set; Telegram ingress disabled. Use `bun run hunt <domain>` instead.");
     return;
   }
+  // Persist the update offset to disk so a serve restart does NOT re-deliver (and re-run) old messages.
+  const OFFSET_FILE = join(RUNS_DIR, ".telegram-offset");
   let offset = 0;
-  log("telegram ingress up; talk to the bot to start");
+  try {
+    offset = Number(readFileSync(OFFSET_FILE, "utf8").trim()) || 0;
+  } catch {
+    /* first run, no offset yet */
+  }
+  log(`telegram ingress up (offset ${offset}); talk to the bot to start`);
   for (;;) {
     try {
       const res = await fetch(api("getUpdates") + `?timeout=50&offset=${offset}`);
       const data = (await res.json()) as any;
       for (const u of data.result ?? []) {
         offset = u.update_id + 1;
+        try {
+          writeFileSync(OFFSET_FILE, String(offset)); // ack before processing so a crash/restart never replays it
+        } catch {
+          /* best effort */
+        }
         const msg = u.message?.text;
         const chatId = u.message?.chat?.id;
         if (!msg || chatId == null) continue;
