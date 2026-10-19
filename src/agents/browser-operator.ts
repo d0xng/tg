@@ -1,7 +1,8 @@
-import { mkdirSync, writeFileSync, rmSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { chrome } from "../config.ts";
 import { log, warn } from "../log.ts";
+import { runLimited } from "../util/pool.ts";
 
 // The browser-operator: launches headless Chrome, navigates the target UNAUTHENTICATED, triggers SPA
 // routes and lazy chunk loads, and captures EVERY piece of JavaScript the page pulls -- static
@@ -144,6 +145,7 @@ async function launchChrome(): Promise<{ proc: Bun.Subprocess; port: number; pro
       "--headless=new",
       `--remote-debugging-port=${port}`,
       "--remote-allow-origins=*", // required for CDP websocket on modern Chrome
+      "--ignore-certificate-errors", // proceed past TLS cert mismatches (CNAME/SNI/Akamai) instead of stopping on Chrome's interstitial, so the actual site loads and its JS is captured
       "--no-sandbox",
       "--disable-gpu",
       "--disable-dev-shm-usage",
@@ -251,6 +253,14 @@ export async function crawl(
     await cdp.send("Network.enable");
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
+    // Proceed past TLS cert errors at the protocol level too: the --ignore-certificate-errors launch
+    // flag is unreliable in headless=new, so a hostname/CNAME cert mismatch (common behind Akamai) can
+    // still strand the main frame on Chrome's interstitial. This makes the site load and its JS capture.
+    try {
+      await cdp.send("Security.setIgnoreCertificateErrors", { ignore: true });
+    } catch {
+      /* older Chrome without this command: the launch flag covers it */
+    }
 
     cdp.on("Network.requestWillBeSent", () => {
       inflight++;
@@ -437,6 +447,94 @@ export async function crawl(
       }
     };
 
+    // --- Webpack/Vite chunk pre-fetching -------------------------------------------------------------
+    // Enumerate the chunk URLs the app CAN lazy-load straight from the runtime bundle and fetch them,
+    // even if no navigation or click ever triggered them. Webpack builds those URLs at runtime from an
+    // id->hash map + a template, so they never appear as string literals and harvestUrls cannot see
+    // them; the discoverer subprocess parses the bundle and computes them. This closes the biggest JS
+    // coverage gap (lazy route / admin bundles). Fetched out-of-band (not via the browser), rate-limited.
+    const CHUNK_DISCOVERER = join(import.meta.dir, "..", "chunk-discoverer", "index.ts");
+    const bruteforceLimit = Number(process.env.CRAWL_CHUNK_BRUTEFORCE ?? 3000);
+    const chunkConc = Number(process.env.CRAWL_CHUNK_CONCURRENCY ?? 4);
+    const chunkDelayMs = Number(process.env.CRAWL_CHUNK_DELAY_MS ?? 150);
+    const runDiscoverer = async (filePath: string): Promise<string[]> => {
+      try {
+        const proc = Bun.spawn([process.execPath, "run", CHUNK_DISCOVERER, filePath, String(bruteforceLimit)], {
+          stdout: "pipe",
+          stderr: "ignore",
+        });
+        const out = await new Response(proc.stdout).text();
+        await proc.exited;
+        return out.split("\n").map((s) => s.trim()).filter(Boolean);
+      } catch {
+        return [];
+      }
+    };
+    // A discovered value may be absolute, root-relative, or publicPath-relative (e.g. "static/chunks/x.js").
+    // Resolve it to concrete URLs; the 200-or-skip check at fetch time discards wrong guesses.
+    const resolveChunk = (value: string, sourceUrl: string): string[] => {
+      const out = new Set<string>();
+      const v = value.trim();
+      if (!v || v.includes("undefined")) return [];
+      if (/^https?:\/\//i.test(v)) { out.add(v); return [...out]; }
+      try { out.add(new URL(v, sourceUrl).href); } catch { /* ignore */ }
+      try { if (v.startsWith("/")) out.add(new URL(v, new URL(sourceUrl).origin).href); } catch { /* ignore */ }
+      const seg = v.replace(/^\//, "").split("/")[0];
+      if (seg) {
+        for (const ku of Object.keys(manifest)) {
+          if (!/^https?:/i.test(ku)) continue;
+          const i = ku.indexOf("/" + seg + "/");
+          if (i !== -1) { out.add(ku.slice(0, i + 1) + v.replace(/^\//, "")); break; }
+        }
+      }
+      return [...out];
+    };
+    const fetchAndSaveChunk = async (url: string): Promise<boolean> => {
+      if (savedUrls.has(url) || !onTarget(url) || isDeniedHost(url)) return false;
+      try {
+        const res = await fetch(url, { tls: { rejectUnauthorized: false }, redirect: "follow" } as any);
+        if (!res.ok) return false;
+        const ct = res.headers.get("content-type") ?? "";
+        const text = await res.text();
+        if (!isJs(url, ct) && /^\s*<(!doctype|html)/i.test(text)) return false; // wrong resolution landed on an HTML page
+        savedUrls.add(url);
+        const name = fileNameFor(url, usedNames);
+        writeFileSync(join(jsDir, name), text);
+        manifest[url] = name;
+        harvestUrls(text); // a fetched chunk can itself reference more routes/chunks
+        await maybeSaveSourceMap(url, text, jsDir, name);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const prefetchChunks = async (): Promise<void> => {
+      let total = 0;
+      for (let round = 0; round < 2; round++) {
+        const candidates = new Set<string>();
+        for (const [u, f] of Object.entries(manifest)) {
+          if (!/^https?:/i.test(u)) continue; // skip inline
+          let body = "";
+          try { body = readFileSync(join(jsDir, f), "utf8"); } catch { continue; }
+          if (!/Loading chunk |__vite__mapDeps/.test(body)) continue; // only runtime/entry bundles carry the chunk map
+          for (const val of await runDiscoverer(join(jsDir, f))) {
+            for (const abs of resolveChunk(val, u)) candidates.add(abs);
+          }
+        }
+        const todo = [...candidates].filter((u) => !savedUrls.has(u) && onTarget(u) && !isDeniedHost(u));
+        if (!todo.length) break;
+        let roundNew = 0;
+        const tasks = todo.map((u) => async () => {
+          if (await fetchAndSaveChunk(u)) roundNew++;
+          await delay(chunkDelayMs);
+        });
+        await runLimited(tasks, chunkConc);
+        total += roundNew;
+        if (!roundNew) break; // nothing new this round -> stable
+      }
+      if (total) log(`[browser-operator] chunk pre-fetch: +${total} lazy chunks not reached by navigation`);
+    };
+
     enqueue(startUrl);
     while (true) {
       if (Date.now() - lastNewJs > idleNoNewJsMs) break; // no new on-target artifact for the idle window
@@ -469,6 +567,7 @@ export async function crawl(
     }
 
     await Promise.allSettled(saves);
+    await prefetchChunks(); // enumerate + fetch lazy Webpack/Vite chunks never triggered by navigation
   } finally {
     cdp?.close();
     try {

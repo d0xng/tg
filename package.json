@@ -9,5 +9,12 @@
     "serve": "bun run src/index.ts",
     "doctor": "bun run src/doctor.ts",
     "smoke": "bun run src/smoke.ts"
+  },
+  "dependencies": {
+    "acorn": "^8.12.1",
+    "acorn-loose": "^8.5.0",
+    "astring": "^1.9.0",
+    "estree-toolkit": "^1.7.8",
+    "sval": "^0.5.2"
   }
 }
