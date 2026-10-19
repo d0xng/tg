@@ -1,0 +1,8 @@
+node_modules/
+runs/
+.env
+*.log
+.chrome-*/
+.env.local
+_test-js/
+/tmp

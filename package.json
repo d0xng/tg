@@ -1,0 +1,13 @@
+{
+  "name": "huntline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Unauthenticated bug-bounty hunting pipeline. An assembly line of specialized agents over subscription CLIs (Claude Code + Codex), not the API: browser-operator -> js-analyzer -> hunters -> validator -> reporter. Flow over bureaucracy; one hard gate (proven end-to-end impact).",
+  "scripts": {
+    "hunt": "bun run src/cli-entry.ts",
+    "serve": "bun run src/index.ts",
+    "doctor": "bun run src/doctor.ts",
+    "smoke": "bun run src/smoke.ts"
+  }
+}
