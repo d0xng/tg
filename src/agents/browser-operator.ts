@@ -186,7 +186,6 @@ export async function crawl(
   const hardDeadline = Date.now() + maxMs;
 
   mkdirSync(jsDir, { recursive: true });
-  const origin = new URL(startUrl).origin;
   const targetHost = new URL(startUrl).hostname.toLowerCase();
   const baseDomain = targetHost.split(".").slice(-2).join(".");
   const allowHosts = (process.env.CRAWL_ALLOW_HOSTS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -201,12 +200,32 @@ export async function crawl(
     }
   };
 
+  // Frontier scope = the start host PLUS any same-registrable-domain host we LAND on by following a
+  // redirect (HTTP or JS). So rdex.verisk.com -> gateway-login.verisk.com (the SSO) is followed and
+  // crawled; a footer link to a sibling marketing site is NOT crawled unless a redirect took us there;
+  // a redirect to a third-party IdP (a different registrable domain) is never added. JS capture stays
+  // registrable-domain (onTarget), so a dependency chunk hosted on a sibling subdomain is still saved
+  // even when we do not crawl that subdomain's pages.
+  const scopeHosts = new Set<string>([targetHost, ...allowHosts]);
+  const sameRegDomain = (h: string): boolean => h === baseDomain || h.endsWith("." + baseDomain);
+  const inScopeHost = (h: string): boolean =>
+    scopeHosts.has(h) || allowHosts.some((a) => h === a || h.endsWith("." + a));
+  const noteLanding = (u: string): void => {
+    try {
+      const h = new URL(u).hostname.toLowerCase();
+      if (sameRegDomain(h)) scopeHosts.add(h);
+    } catch {
+      /* ignore */
+    }
+  };
+
   const { proc, port, profile } = await launchChrome();
   let cdp: CDP | null = null;
   const manifest: Record<string, string> = {};
   const usedNames = new Set<string>();
   const savedUrls = new Set<string>();
   const saves: Promise<void>[] = [];
+  let pendingSaves = 0; // bodies still being fetched + harvested; the loop must not quit while > 0
   const respMeta = new Map<string, { url: string; mime: string }>();
   let inflight = 0;
   let lastActivity = Date.now();
@@ -251,7 +270,21 @@ export async function crawl(
       if (meta && isJs(meta.url, meta.mime) && !savedUrls.has(meta.url) && onTarget(meta.url) && !isDeniedHost(meta.url)) {
         savedUrls.add(meta.url);
         markNewJs();
-        saves.push(saveBody(cdp!, p.requestId, meta.url, jsDir, usedNames, manifest));
+        pendingSaves++;
+        saves.push(
+          saveBody(cdp!, p.requestId, meta.url, jsDir, usedNames, manifest, harvestUrls).finally(() => {
+            pendingSaves--;
+          }),
+        );
+        // A same-registrable-domain subdomain we pull first-party JS from is part of the app (e.g. an
+        // SSO embedded as a widget/micro-frontend, not a top-level redirect). Bring it into scope: that
+        // seeds its root AND releases any routes already harvested for it from other bundles.
+        try {
+          const h = new URL(meta.url).hostname.toLowerCase();
+          if (sameRegDomain(h)) addScopeHost(h);
+        } catch {
+          /* ignore */
+        }
       }
     });
 
@@ -282,8 +315,11 @@ export async function crawl(
       }
     };
 
-    // Same-origin link frontier. Keep discovering links, clicking everything, and navigating; stop
-    // ONLY when no new JS has appeared for idleNoNewJsMs (or the safety ceiling / page cap is hit).
+    // Same-DOMAIN link frontier: the target's registrable domain and ALL its subdomains are in scope,
+    // so a redirect to a sibling subdomain (e.g. an SSO host like gateway-login.verisk.com) is followed
+    // and its pages are crawled, not merely captured. Keep discovering links, clicking everything, and
+    // navigating; stop ONLY when no new JS has appeared for idleNoNewJsMs (or the safety ceiling / page
+    // cap is hit).
     const visited = new Set<string>();
     const queued = new Set<string>();
     const frontier: string[] = [];
@@ -294,12 +330,61 @@ export async function crawl(
       } catch {
         return;
       }
-      if (n.origin !== origin) return; // stay on the target origin
+      if (n.protocol !== "http:" && n.protocol !== "https:") return; // only navigable web pages
+      if (!inScopeHost(n.hostname.toLowerCase())) return; // frontier = start host + same-domain redirect targets, NOT every linked sibling subdomain
       n.hash = "";
       const s = n.href;
       if (visited.has(s) || queued.has(s)) return;
       queued.add(s);
       frontier.push(s);
+    };
+    // A URL harvested from JS is only worth WALKING once its host proves to be part of the app: i.e. we
+    // actually load first-party JS from it (addScopeHost) or a redirect lands us on it. Same-domain URLs
+    // for hosts not yet proven in-scope wait in pendingHarvest, so a route referenced in rdex's bundle
+    // BEFORE gateway-login is known still gets walked once gateway-login enters scope (no ordering race),
+    // while marketing hosts that merely appear as strings and whose code we never load are never walked.
+    const pendingHarvest = new Set<string>();
+    const drainPending = (): void => {
+      for (const u of [...pendingHarvest]) {
+        try {
+          if (inScopeHost(new URL(u).hostname.toLowerCase())) {
+            pendingHarvest.delete(u);
+            enqueue(u);
+          }
+        } catch {
+          pendingHarvest.delete(u);
+        }
+      }
+    };
+    const addScopeHost = (h: string): void => {
+      if (scopeHosts.has(h)) return;
+      scopeHosts.add(h);
+      enqueue(`https://${h}/`); // seed its root
+      drainPending(); // release routes already harvested for this host
+    };
+    // Routes that only live as string literals inside JS (SPA router configs) never appear as <a href>,
+    // so harvest absolute same-domain URLs from every captured bundle. This is how the SSO's real pages
+    // (e.g. /app/dcp/auth/login, /app/isonet/reset-password/request) get walked: they are strings in the
+    // bundles, not links on the page. GET-only; assets and APIs are skipped.
+    const ASSET_EXT = /\.(m?js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|map|json|mp4|webm|avif|wasm|pdf|xml|txt)(\?|#|$)/i;
+    const harvestUrls = (text: string): void => {
+      const found = text.match(/https?:\/\/[a-zA-Z0-9.\-]+(?::\d+)?(?:\/[^\s"'`<>()\\{}|]*)?/g);
+      if (!found) return;
+      let seen = 0;
+      for (const raw of found) {
+        if (seen > 400) break;
+        const u = raw.replace(/[.,);:]+$/, "");
+        if (ASSET_EXT.test(u) || /\/(api|graphql)\b|\/v\d+\//i.test(u)) continue;
+        try {
+          const h = new URL(u).hostname.toLowerCase();
+          if (!sameRegDomain(h)) continue; // only the target's own registrable domain
+          seen++;
+          if (inScopeHost(h)) enqueue(u); // host already proven in-scope -> walk it now
+          else pendingHarvest.add(u); // wait until we load first-party JS from this host (or get redirected there)
+        } catch {
+          /* ignore */
+        }
+      }
     };
     const collectLinks = async (): Promise<void> => {
       try {
@@ -313,12 +398,39 @@ export async function crawl(
         /* best effort */
       }
     };
+    const currentUrl = async (): Promise<string> => {
+      try {
+        const r = await cdp!.send<any>("Runtime.evaluate", { expression: "location.href", returnByValue: true });
+        return r.result?.value ?? "";
+      } catch {
+        return "";
+      }
+    };
+    // Click EVERYTHING interactive, not just <button>. React/Angular/Vue bind clicks with
+    // addEventListener (no onclick attribute), so besides the obvious interactive selectors we also
+    // treat any element whose computed cursor is "pointer" as clickable. Each click can open a menu or
+    // lazy-load a route chunk, which the network layer then captures -- every button unlocks more JS.
+    // Guards keep it non-destructive: we never click real form-submit controls (so no data is
+    // submitted), never click a real <a href> (those are walked through the frontier, not clicked, so a
+    // click never navigates us off the page), and never open a new tab.
     const clickAll = async (): Promise<void> => {
       try {
         await cdp!.send("Runtime.evaluate", {
-          expression:
-            "(()=>{let n=0;document.querySelectorAll('button,[role=button],[onclick],[data-toggle],[data-bs-toggle]').forEach(b=>{try{b.click();n++;}catch(e){}});return n;})()",
-          timeout: 4000,
+          expression: `(()=>{
+            const set=new Set([...document.querySelectorAll('button,[role=button],[role=menuitem],[role=tab],[role=link],[role=switch],[onclick],[data-toggle],[data-bs-toggle],[routerlink],[ng-click],summary,details,[tabindex]')]);
+            for(const el of document.querySelectorAll('a,button,div,span,li,i,svg,img,p,label,td,th,[class],[role]')){try{if(getComputedStyle(el).cursor==='pointer')set.add(el);}catch(e){}}
+            let n=0;
+            for(const el of set){try{
+              const tag=el.tagName;
+              const type=((el.getAttribute&&el.getAttribute('type'))||'').toLowerCase();
+              if(type==='submit'||type==='image'||el.type==='submit')continue;   // never submit data
+              if(tag==='A'&&el.getAttribute('href'))continue;                    // real links go through the frontier, not clicks
+              if(el.target==='_blank')continue;                                  // never open external tabs
+              el.click();n++;
+            }catch(e){}}
+            return n;
+          })()`,
+          timeout: 8000,
         });
       } catch {
         /* best effort */
@@ -332,7 +444,7 @@ export async function crawl(
       if (pages >= maxPages) break;
       const url = frontier.shift();
       if (!url) {
-        if (inflight <= 0) break; // nothing queued and nothing loading -> done
+        if (inflight <= 0 && pendingSaves <= 0) break; // nothing queued, loading, or still being saved/harvested -> done
         await delay(250);
         continue;
       }
@@ -343,8 +455,12 @@ export async function crawl(
       try {
         await cdp.send("Page.navigate", { url });
         await waitIdle();
+        noteLanding(await currentUrl()); // followed an HTTP/JS redirect? bring that same-domain landing host into scope
         await clickAll();
         await waitIdle();
+        await clickAll(); // second pass: click the buttons the first pass revealed (expanded menus, wizard steps)
+        await waitIdle();
+        noteLanding(await currentUrl()); // a click may have redirected us cross-subdomain too
         await captureInline();
         await collectLinks();
       } catch {
@@ -380,14 +496,17 @@ async function saveBody(
   jsDir: string,
   usedNames: Set<string>,
   manifest: Record<string, string>,
+  onBody?: (text: string) => void,
 ): Promise<void> {
   try {
     const { body, base64Encoded } = await cdp.send<any>("Network.getResponseBody", { requestId });
     const buf = base64Encoded ? Buffer.from(body, "base64") : Buffer.from(body, "utf8");
     const name = fileNameFor(url, usedNames);
+    const text = buf.toString("utf8");
     writeFileSync(join(jsDir, name), buf);
     manifest[url] = name;
-    await maybeSaveSourceMap(url, buf.toString("utf8"), jsDir, name);
+    if (onBody) onBody(text); // seed any in-scope route URLs this bundle references
+    await maybeSaveSourceMap(url, text, jsDir, name);
   } catch {
     /* body may be gone after a route change; acceptable */
   }
