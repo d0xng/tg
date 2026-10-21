@@ -1,6 +1,6 @@
-import { readFileSync } from "fs";
+import { readFileSync, readdirSync, statSync, readlinkSync } from "fs";
 import { join } from "path";
-import { agents, PROMPTS_DIR } from "../config.ts";
+import { agents, PROMPTS_DIR, RUNS_DIR } from "../config.ts";
 import { runAgent } from "../cli.ts";
 import { notify } from "../telegram.ts";
 import { expandScope } from "../recon/expand.ts";
@@ -12,7 +12,8 @@ import { log, warn } from "../log.ts";
 // per-chat transcript and answered by a Claude agent (recon.md). The operator chats freely; when the
 // scope is clear the agent emits a `@@LAUNCH {hosts,wildcards}` directive on its last line, which we
 // strip (the operator never sees it), expand (wildcards -> subfinder|httpx live hosts), and run through
-// orchestrate() host by host. One run at a time.
+// orchestrate() host by host. The pipeline runs DETACHED (not awaited), so the poll loop stays free to
+// answer messages (e.g. `status`) while a run is in flight; `busy` still serializes to one run at a time.
 
 interface Turn {
   role: "operator" | "recon";
@@ -22,7 +23,91 @@ const histories = new Map<number, Turn[]>();
 const MAX_TURNS = 24;
 let busy = false;
 
+// Run dirs that have a live stage child right now. Stage children (claude/codex/glm) are spawned with
+// cwd = the run dir, so their /proc/<pid>/cwd points straight at the run they are working. This is the
+// authoritative "is it actually running" signal: it does not false-positive on a hunter that grinds one
+// lead for 15 minutes writing nothing. Shared by statusReport and (later) the watchdog.
+export function liveRunDirs(): Set<string> {
+  const live = new Set<string>();
+  let pids: string[] = [];
+  try {
+    pids = readdirSync("/proc").filter((p) => /^\d+$/.test(p));
+  } catch {
+    return live;
+  }
+  for (const pid of pids) {
+    try {
+      const cwd = readlinkSync(`/proc/${pid}/cwd`);
+      if (cwd.startsWith(RUNS_DIR + "/")) live.add(cwd);
+    } catch {
+      /* process gone or not readable */
+    }
+  }
+  return live;
+}
+
+// Minutes since a run dir last showed file activity (run.jsonl or run.json), or a large number if none.
+function runAgeMin(dir: string): number {
+  let age = 1e9;
+  for (const p of [join(dir, "logs", "run.jsonl"), join(dir, "run.json")]) {
+    try {
+      age = Math.min(age, Math.round((Date.now() - statSync(p).mtimeMs) / 60000));
+    } catch {
+      /* ignore */
+    }
+  }
+  return age;
+}
+
+// Fast, LLM-free status. A non-terminal run is ACTIVE if a stage child is working it (process cwd) or it
+// showed file activity in the last ACTIVE_MIN minutes; older non-terminal runs are stale corpses and are
+// only counted, not listed, so the report stays about what is actually running now.
+export function statusReport(): string {
+  const TERMINAL = new Set(["done", "error"]);
+  const ACTIVE_MIN = 20;
+  const live = liveRunDirs();
+  let dirs: string[] = [];
+  try {
+    dirs = readdirSync(RUNS_DIR).filter((d) => /\dZ_/.test(d));
+  } catch {
+    /* no runs dir yet */
+  }
+  dirs.sort().reverse();
+  const active: string[] = [];
+  let stale = 0;
+  for (const d of dirs) {
+    let st: any;
+    try {
+      st = JSON.parse(readFileSync(join(RUNS_DIR, d, "run.json"), "utf8"));
+    } catch {
+      continue;
+    }
+    if (TERMINAL.has(st.stage)) continue;
+    const full = join(RUNS_DIR, d);
+    const age = runAgeMin(full);
+    if (live.has(full) || age <= ACTIVE_MIN) {
+      const c = st.counts ?? {};
+      const proc = live.has(full) ? "process alive" : `last activity ${age}m ago`;
+      active.push(`- ${st.domain}: ${st.stage} (js ${c.jsFiles ?? 0}, leads ${c.leads ?? 0}, findings ${c.findings ?? 0}; ${proc})`);
+    } else {
+      stale++;
+    }
+  }
+  const head = busy ? "Serve: a Telegram run is in progress (busy)." : "Serve: idle, no Telegram run.";
+  const parts = [head];
+  parts.push(active.length ? `${active.length} run(s) active:\n` + active.join("\n") : "No run is currently active.");
+  if (stale) parts.push(`(+${stale} older unfinished run(s) with no recent activity, likely dead; worth a cleanup.)`);
+  return parts.join("\n");
+}
+
 export async function handleMessage(text: string, chatId: number): Promise<void> {
+  // Status command: answered instantly from disk, never routed to the recon LLM, never touches busy,
+  // so it works even while a run is in flight.
+  const cmd = text.trim().toLowerCase();
+  if (cmd === "status" || cmd === "/status" || cmd === "estado" || cmd === "ping") {
+    await notify(statusReport());
+    return;
+  }
   const methodology = readFileSync(join(PROMPTS_DIR, "recon.md"), "utf8");
   const hist = histories.get(chatId) ?? [];
   hist.push({ role: "operator", content: text });
@@ -73,7 +158,9 @@ export async function handleMessage(text: string, chatId: number): Promise<void>
       warn("[recon] bad LAUNCH json:", m[1]);
       return;
     }
-    await launch(dir);
+    // Detached on purpose: do NOT await the pipeline, or the poll loop blocks for the whole run and the
+    // bot goes mute. launch() sets busy synchronously on entry, so a second LAUNCH is still rejected.
+    launch(dir).catch((e) => warn("[recon] launch crashed:", String(e)));
   }
 }
 
