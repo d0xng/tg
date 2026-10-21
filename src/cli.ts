@@ -1,5 +1,5 @@
 import type { AgentSpec } from "./config.ts";
-import { codexEffortConfig, deepseek, glm } from "./config.ts";
+import { accountToken, codexEffortConfig, deepseek, glm, stripAccountTag } from "./config.ts";
 import { log, warn } from "./log.ts";
 
 export interface CliResult {
@@ -82,19 +82,34 @@ export async function runClaude(
   // cannot be used with root/sudo"). Instead allow-list the tools the agents need so they run
   // headless without prompts: shell (curl), file IO, search, web, and sub-agents.
   const tools = opts.allowedTools ?? ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Task"];
+  // An account tag ("claude-opus-5-5@a") picks WHICH subscription runs this agent; the tag never goes
+  // to --model.
+  const model = stripAccountTag(spec.model);
+  const token = accountToken(spec.model);
   const args = [
     "claude",
     "-p",
     "--model",
-    spec.model,
+    model,
     "--output-format",
     "json",
     "--allowedTools",
     tools.join(" "),
   ];
   for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
-  log(`[${spec.role}] claude -p model=${spec.model} cwd=${opts.cwd}`);
-  const r = await spawnCapture(args, { cwd: opts.cwd, stdin: prompt, timeoutMs: opts.timeoutMs });
+  // Build the environment explicitly on the subscription path so that (a) a tagged id swaps in that
+  // account's OAuth token, letting two subscriptions run in parallel, and (b) a stray ANTHROPIC_API_KEY
+  // or ANTHROPIC_AUTH_TOKEN can never silently take over: the CLI ranks API keys ABOVE the OAuth token,
+  // so one left in the environment would bill per-token instead of drawing on the subscription, with no
+  // prompt in -p mode. Untagged ids keep the box-default CLAUDE_CODE_OAUTH_TOKEN copied from the env.
+  const envFull: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined || k === "ANTHROPIC_API_KEY" || k === "ANTHROPIC_AUTH_TOKEN") continue;
+    envFull[k] = v;
+  }
+  if (token) envFull.CLAUDE_CODE_OAUTH_TOKEN = token;
+  log(`[${spec.role}] claude -p model=${model}${token ? " acct=tagged" : ""} cwd=${opts.cwd}`);
+  const r = await spawnCapture(args, { cwd: opts.cwd, stdin: prompt, timeoutMs: opts.timeoutMs, envFull });
   if (r.timedOut) warn(`[${spec.role}] claude timed out`);
   return r;
 }

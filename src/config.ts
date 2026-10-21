@@ -47,10 +47,31 @@ export const glm = {
   baseUrl: process.env.GLM_BASE_URL ?? "https://api.z.ai/api/anthropic",
 };
 
+// A claude-* model id may carry an ACCOUNT TAG, e.g. "claude-opus-5-5@a", naming WHICH Claude
+// subscription runs it, so two subscriptions can work in parallel on one box (each `claude` process
+// takes its credential from its own environment). The tag resolves to the OAuth token in
+// CLAUDE_OAUTH_<TAG>, minted once per account with `claude setup-token` (a one-year token, which also
+// survives unattended runs better than a /login credential that can expire). An untagged id resolves to
+// nothing here and keeps the box default CLAUDE_CODE_OAUTH_TOKEN, so existing rosters are unaffected.
+// The tag is a claude-subscription convention only: glm-*/deepseek-*/gpt-* ids carry their own keys.
+export function stripAccountTag(model: string): string {
+  const at = model.indexOf("@");
+  return at < 0 ? model : model.slice(0, at);
+}
+
+export function accountToken(model: string): string | undefined {
+  const at = model.indexOf("@");
+  if (at < 0) return undefined;
+  const tag = model.slice(at + 1).toUpperCase();
+  return process.env[`CLAUDE_OAUTH_${tag}`] || undefined;
+}
+
 // Map a model id to the CLI that runs it: deepseek-* via the claude CLI pointed at DeepSeek, glm-* via
 // the claude CLI pointed at GLM's Coding Plan endpoint, gpt-* via codex, everything else (claude-*) via
-// the claude CLI with the Max subscription.
+// the claude CLI with the Max subscription. The account tag is stripped first so "claude-opus-5-5@a"
+// still routes to the subscription CLI.
 export function providerForModel(model: string): Provider {
+  model = stripAccountTag(model);
   if (model.startsWith("deepseek")) return "deepseek";
   if (model.startsWith("glm")) return "glm";
   if (model.startsWith("gpt")) return "codex";
@@ -76,6 +97,10 @@ export const agents = {
   // glm-* id runs on GLM's Coding Plan automatically: e.g. HUNTER2_MODEL=glm-5.3 HUNTER3_MODEL=glm-5.3-flash
   // in .env, then restart. The key must be a Coding-Plan key (a general key 1113s); use plain ids, the
   // "[1m]" alias is 1211 Unknown on --model. Defaults stay on opus.
+  // To run TWO Claude subscriptions side by side, append an account tag and set its token in .env:
+  // HUNTER1_MODEL=claude-opus-5-5@a with CLAUDE_OAUTH_A=..., HUNTER2_MODEL=claude-opus-5-5@b with
+  // CLAUDE_OAUTH_B=... . modelTag turns the "@" into "-", so the role (and every finding's provenance
+  // line and log filename) names the account that ran it: hunter-opus-5-5-a.
   hunters: [
     { role: `hunter-${modelTag(process.env.HUNTER1_MODEL ?? "claude-opus-5")}`,  provider: providerForModel(process.env.HUNTER1_MODEL ?? "claude-opus-5"),  model: process.env.HUNTER1_MODEL ?? "claude-opus-5",  effort: EFFORT },
     { role: `hunter-${modelTag(process.env.HUNTER2_MODEL ?? "claude-opus-4-8")}`, provider: providerForModel(process.env.HUNTER2_MODEL ?? "claude-opus-4-8"), model: process.env.HUNTER2_MODEL ?? "claude-opus-4-8", effort: EFFORT },
