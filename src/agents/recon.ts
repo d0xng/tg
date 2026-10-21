@@ -36,12 +36,26 @@ export function liveRunDirs(): Set<string> {
     return live;
   }
   for (const pid of pids) {
+    let cwd: string;
     try {
-      const cwd = readlinkSync(`/proc/${pid}/cwd`);
-      if (cwd.startsWith(RUNS_DIR + "/")) live.add(cwd);
+      cwd = readlinkSync(`/proc/${pid}/cwd`);
     } catch {
-      /* process gone or not readable */
+      continue; // process gone or not readable
     }
+    if (!cwd.startsWith(RUNS_DIR + "/")) continue;
+    let cmd = "";
+    try {
+      cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    } catch {
+      continue;
+    }
+    // Count ONLY real pipeline stage children (claude/codex/glm agents, which carry the skills add-dir
+    // or run under codex), NOT the Xvfb/chrome/cat tools a hunter agent spawns and leaves orphaned in the
+    // run dir; those would otherwise mark a long-dead run as "alive".
+    if (!cmd.includes("/opt/huntline/skills") && !cmd.includes("codex")) continue;
+    // cwd may be the run dir itself or a subdir the agent cd'd into; map back to the run dir.
+    const rel = cwd.slice(RUNS_DIR.length + 1).split("/")[0];
+    if (rel) live.add(join(RUNS_DIR, rel));
   }
   return live;
 }
