@@ -88,8 +88,12 @@ export function modelTag(model: string): string {
 export const agents = {
   jsAnalyzer: {
     role: "js-analyzer",
-    provider: "deepseek",
-    model: process.env.JS_MODEL ?? "deepseek-flash", // DeepSeek-V4.1-Flash, PRIMARY analyzer (1M ctx, no OpenAI cyber classifier)
+    // Provider follows the model id, like every other spec. It used to be pinned to "deepseek", which
+    // made the spec lie whenever JS_MODEL named another provider's model (e.g. JS_MODEL=glm-5.3-flash
+    // sent a GLM id to DeepSeek and 400'd). runJsMiners overrides provider per chain entry, so the live
+    // analyzing stage was unaffected, but anything using this spec directly got a confusing failure.
+    provider: providerForModel(process.env.JS_MODEL ?? "deepseek-flash"),
+    model: process.env.JS_MODEL ?? "deepseek-flash", // DeepSeek-V4.1-Flash by default (1M ctx)
     effort: "high",
   } as AgentSpec,
   // Leads are dealt round-robin across these hunters, one lead per hunter, each hunter in its own
