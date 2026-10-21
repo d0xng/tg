@@ -365,17 +365,28 @@ export async function crawl(
     const visited = new Set<string>();
     const queued = new Set<string>();
     const frontier: string[] = [];
-    const enqueue = (u: string): void => {
+    // Canonicalize before dedup: collapse HTML-entity re-encoding (&amp; -> &, applied repeatedly so
+    // &amp;amp;amp;... all fold to a single &), drop the fragment, and let URL normalize the rest.
+    // Without this, a page that reflects its own query into its links grows one more &amp; per hop, so
+    // every variant looks like a brand new URL and the crawl loops forever (seen on
+    // oportun.com/download?utm_source=...&amp;amp;amp;...). Returns null for non-navigable or invalid URLs.
+    const canonUrl = (u: string): string | null => {
+      let d = u;
+      for (let i = 0; i < 6 && /&amp;/i.test(d); i++) d = d.replace(/&amp;/gi, "&");
       let n: URL;
       try {
-        n = new URL(u);
+        n = new URL(d);
       } catch {
-        return;
+        return null;
       }
-      if (n.protocol !== "http:" && n.protocol !== "https:") return; // only navigable web pages
-      if (!inScopeHost(n.hostname.toLowerCase())) return; // frontier = start host + same-domain redirect targets, NOT every linked sibling subdomain
+      if (n.protocol !== "http:" && n.protocol !== "https:") return null;
       n.hash = "";
-      const s = n.href;
+      return n.href;
+    };
+    const enqueue = (u: string): void => {
+      const s = canonUrl(u);
+      if (!s) return;
+      if (!inScopeHost(new URL(s).hostname.toLowerCase())) return; // frontier = start host + same-domain redirect targets, NOT every linked sibling subdomain
       if (visited.has(s) || queued.has(s)) return;
       queued.add(s);
       frontier.push(s);
@@ -387,16 +398,9 @@ export async function crawl(
     const fallback: string[] = [];
     const fallbackQueued = new Set<string>();
     const enqueueFallback = (u: string): void => {
-      let n: URL;
-      try {
-        n = new URL(u);
-      } catch {
-        return;
-      }
-      if (n.protocol !== "http:" && n.protocol !== "https:") return;
-      if (!inScopeHost(n.hostname.toLowerCase())) return;
-      n.hash = "";
-      const s = n.href;
+      const s = canonUrl(u);
+      if (!s) return;
+      if (!inScopeHost(new URL(s).hostname.toLowerCase())) return;
       if (visited.has(s) || queued.has(s) || fallbackQueued.has(s)) return;
       fallbackQueued.add(s);
       fallback.push(s);
