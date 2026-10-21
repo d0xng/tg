@@ -8,6 +8,7 @@ import { runReporter } from "./agents/reporter.ts";
 import { notifyMd, sendDocument, mdEscape } from "./telegram.ts";
 import { jsonl, log, err as logErr } from "./log.ts";
 import { timeouts } from "./config.ts";
+import { killRunProcesses } from "./util/procs.ts";
 import { Run } from "./run.ts";
 
 // The orchestrator sequences the full assembly line for ONE host and reports to Telegram at every phase
@@ -123,6 +124,18 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
     jsonl(run.logFile, { event: "run:error", error: String(e) });
     logErr(`run ${run.state.id} failed:`, e);
     await notifyMd(`*Run error* ${EMDASH} ${dom()}\n${mdEscape(String(e))}`);
+  } finally {
+    // Reap everything this run spawned (stage agents and the Xvfb/chrome/chromedriver they launch to
+    // test the DOM), identified by a cwd inside the run dir, so nothing is left hanging after the run
+    // ends, errors, or returns early. Runs on every exit path of this try. Best effort.
+    try {
+      const n = await killRunProcesses(run.dir);
+      if (n) {
+        log(`run ${run.state.id}: reaped ${n} leftover process(es)`);
+        jsonl(run.logFile, { event: "run:reaped", processes: n });
+      }
+    } catch (e) {
+      logErr(`run ${run.state.id}: reap failed:`, e);
+    }
   }
 }
-
