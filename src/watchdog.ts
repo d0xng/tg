@@ -35,6 +35,7 @@ async function main() {
   const live = liveRunDirs(RUNS_DIR);
   const running: string[] = [];
   const freshStalls: string[] = [];
+  let wedged = 0;
 
   for (const d of dirs) {
     const full = join(RUNS_DIR, d);
@@ -53,6 +54,7 @@ async function main() {
     }
 
     // Wedged/dead: reap orphans, mark it dead so it is cleaned once and not re-alerted.
+    wedged++;
     const killed = await killRunProcesses(full);
     const prevStage = st.stage;
     const fresh = age <= ALERT_FRESH_MIN;
@@ -68,6 +70,10 @@ async function main() {
       freshStalls.push(`- ${st.domain}: died at ${prevStage} (no process, last activity ${age}m ago)${killed ? `, reaped ${killed} leftover proc(s)` : ""}`);
     }
   }
+
+  // Heartbeat to the LOG only (never Telegram): one line per pass so `tail huntline-watchdog.log` proves
+  // the cron is alive even when there is nothing to report.
+  log(`[watchdog] pass: running=${running.length} wedged=${wedged} fresh-alert=${freshStalls.length}`);
 
   if (freshStalls.length) {
     const body = ["Watchdog: run(s) stopped making progress and were marked dead:", ...freshStalls];
