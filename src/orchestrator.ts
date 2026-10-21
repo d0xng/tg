@@ -116,7 +116,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
       }
     }
     run.setStage("done");
-    jsonl(run.logFile, { event: "run:done", findings: findingFiles.length, valid, reports: reportFiles.length });
+    jsonl(run.logFile, { event: "run:done", findings: findingFiles.length, valid: v.valid, reports: reportFiles.length });
   } catch (e) {
     run.state.error = String(e);
     run.setStage("error");
