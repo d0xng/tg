@@ -108,6 +108,11 @@ export async function runClaude(
     envFull[k] = v;
   }
   if (token) envFull.CLAUDE_CODE_OAUTH_TOKEN = token;
+  // A tag with no token behind it would quietly fall back to the box default, putting two "different"
+  // accounts on the same subscription without anyone noticing. Say so instead.
+  if (!token && model !== spec.model) {
+    warn(`[${spec.role}] model "${spec.model}" carries an account tag but CLAUDE_OAUTH_${spec.model.slice(spec.model.indexOf("@") + 1).toUpperCase()} is unset; falling back to the box default subscription`);
+  }
   log(`[${spec.role}] claude -p model=${model}${token ? " acct=tagged" : ""} cwd=${opts.cwd}`);
   const r = await spawnCapture(args, { cwd: opts.cwd, stdin: prompt, timeoutMs: opts.timeoutMs, envFull });
   if (r.timedOut) warn(`[${spec.role}] claude timed out`);
