@@ -1,0 +1,6 @@
+# huntline watchdog: every 5 minutes, flag/clean wedged runs and alert on Telegram.
+# Install: cp ops/huntline-watchdog.cron /etc/cron.d/huntline-watchdog  (mode 0644, owned by root)
+# Runs from /opt/huntline so bun auto-loads .env (Telegram creds for the alert). BUN is the absolute path
+# to bun because cron has a minimal PATH. Edit BUN below if bun lives elsewhere on this box.
+SHELL=/bin/bash
+*/5 * * * * root cd /opt/huntline && /root/.npm-global/bin/bun run src/watchdog.ts >> /var/log/huntline-watchdog.log 2>&1

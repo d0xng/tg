@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync, readlinkSync } from "fs";
+import { readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { agents, PROMPTS_DIR, RUNS_DIR } from "../config.ts";
 import { runAgent } from "../cli.ts";
@@ -6,6 +6,7 @@ import { notify } from "../telegram.ts";
 import { expandScope } from "../recon/expand.ts";
 import { Run } from "../run.ts";
 import { orchestrate } from "../orchestrator.ts";
+import { liveRunDirs, runActivityAgeMin } from "../util/procs.ts";
 import { log, warn } from "../log.ts";
 
 // The recon agent is the conversational front of the pipeline. Each Telegram message is appended to a
@@ -23,55 +24,7 @@ const histories = new Map<number, Turn[]>();
 const MAX_TURNS = 24;
 let busy = false;
 
-// Run dirs that have a live stage child right now. Stage children (claude/codex/glm) are spawned with
-// cwd = the run dir, so their /proc/<pid>/cwd points straight at the run they are working. This is the
-// authoritative "is it actually running" signal: it does not false-positive on a hunter that grinds one
-// lead for 15 minutes writing nothing. Shared by statusReport and (later) the watchdog.
-export function liveRunDirs(): Set<string> {
-  const live = new Set<string>();
-  let pids: string[] = [];
-  try {
-    pids = readdirSync("/proc").filter((p) => /^\d+$/.test(p));
-  } catch {
-    return live;
-  }
-  for (const pid of pids) {
-    let cwd: string;
-    try {
-      cwd = readlinkSync(`/proc/${pid}/cwd`);
-    } catch {
-      continue; // process gone or not readable
-    }
-    if (!cwd.startsWith(RUNS_DIR + "/")) continue;
-    let cmd = "";
-    try {
-      cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8");
-    } catch {
-      continue;
-    }
-    // Count ONLY real pipeline stage children (claude/codex/glm agents, which carry the skills add-dir
-    // or run under codex), NOT the Xvfb/chrome/cat tools a hunter agent spawns and leaves orphaned in the
-    // run dir; those would otherwise mark a long-dead run as "alive".
-    if (!cmd.includes("/opt/huntline/skills") && !cmd.includes("codex")) continue;
-    // cwd may be the run dir itself or a subdir the agent cd'd into; map back to the run dir.
-    const rel = cwd.slice(RUNS_DIR.length + 1).split("/")[0];
-    if (rel) live.add(join(RUNS_DIR, rel));
-  }
-  return live;
-}
-
-// Minutes since a run dir last showed file activity (run.jsonl or run.json), or a large number if none.
-function runAgeMin(dir: string): number {
-  let age = 1e9;
-  for (const p of [join(dir, "logs", "run.jsonl"), join(dir, "run.json")]) {
-    try {
-      age = Math.min(age, Math.round((Date.now() - statSync(p).mtimeMs) / 60000));
-    } catch {
-      /* ignore */
-    }
-  }
-  return age;
-}
+// liveRunDirs and runActivityAgeMin live in util/procs.ts, shared with the watchdog.
 
 // Fast, LLM-free status. A non-terminal run is ACTIVE if a stage child is working it (process cwd) or it
 // showed file activity in the last ACTIVE_MIN minutes; older non-terminal runs are stale corpses and are
@@ -79,7 +32,7 @@ function runAgeMin(dir: string): number {
 export function statusReport(): string {
   const TERMINAL = new Set(["done", "error"]);
   const ACTIVE_MIN = 20;
-  const live = liveRunDirs();
+  const live = liveRunDirs(RUNS_DIR);
   let dirs: string[] = [];
   try {
     dirs = readdirSync(RUNS_DIR).filter((d) => /\dZ_/.test(d));
@@ -98,7 +51,7 @@ export function statusReport(): string {
     }
     if (TERMINAL.has(st.stage)) continue;
     const full = join(RUNS_DIR, d);
-    const age = runAgeMin(full);
+    const age = runActivityAgeMin(full);
     if (live.has(full) || age <= ACTIVE_MIN) {
       const c = st.counts ?? {};
       const proc = live.has(full) ? "process alive" : `last activity ${age}m ago`;
