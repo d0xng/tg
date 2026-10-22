@@ -2,6 +2,7 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { crawl } from "./agents/browser-operator.ts";
 import { runJsMiners } from "./agents/js-miners.ts";
+import { enrichCorpus } from "./agents/js-enrich.ts";
 import { runHunters } from "./agents/hunter.ts";
 import { runValidator } from "./agents/validator.ts";
 import { runReporter } from "./agents/reporter.ts";
@@ -58,6 +59,22 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
 
     // Stage 2 - js-miners (parallel readers emit leads)
     run.setStage("analyzing");
+    // Enrich the corpus first: recover the original sources from any .map the crawl captured (the
+    // crawler has always downloaded them and nothing ever read them), and beautify what is left, so
+    // a miner reads named source instead of one 5 MB line. Never fatal: a corpus that cannot be
+    // enriched is still the corpus the crawl produced.
+    try {
+      const enriched = await enrichCorpus(run);
+      if (enriched && enriched.maps.written) {
+        await notifyMd(
+          `*Source maps reversed* ${dom()}\n${mdEscape(
+            `${enriched.maps.written} original files from ${enriched.maps.withContent} maps`,
+          )}`,
+        );
+      }
+    } catch (e) {
+      logErr(`[js-enrich] stage failed, continuing with the raw corpus: ${(e as Error).message}`);
+    }
     const leads = await runJsMiners(run);
     const leadFiles = run.listMd("leads");
     await notifyMd(`*Analysis done* ${EMDASH} ${dom()}\n${mdEscape(`${leads} lead${leads === 1 ? "" : "s"}`)}`);

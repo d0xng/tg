@@ -42,7 +42,22 @@ export async function runJsMiners(
   const sliceSize = opts.sliceSize ?? Number(process.env.MINER_SLICE ?? 25);
   const concurrency = opts.concurrency ?? Number(process.env.MINER_CONCURRENCY ?? 5);
   const jsDir = run.sub("js");
-  const files = readdirSync(jsDir).filter((f) => /\.(m?js)$/i.test(f)); // chunks + inline; .map handled separately
+  // Everything a corpus can legitimately contain, not just .js. The filter used to be /\.(m?js)$/
+  // with a comment claiming ".map handled separately", and no such handling existed: a source map was
+  // downloaded by the crawler and then never read by anybody. Now js-enrich reverses the maps, and a
+  // third of what comes out of the maps on disk is TypeScript (measured: 129 .js, 61 .ts, 5 .tsx,
+  // 1 .css), so the extensions have to be here or that code is recovered and then ignored.
+  // SOURCES is the list; override it with MINER_EXTS (comma separated, no dots).
+  // `map` is deliberately NOT here: js-enrich already pulls the original files out of every map that
+  // carries sourcesContent, so handing a miner the raw .map as well is the same code twice in a
+  // multi-megabyte JSON blob. For a map with no sourcesContent, js-enrich writes the sources[] list
+  // as a small .json instead, which is the part worth reading: the app's own file tree.
+  const exts = (process.env.MINER_EXTS ?? "js,mjs,cjs,ts,tsx,jsx,mts,cts,vue,svelte,html,htm,json")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const extRe = new RegExp(`\\.(${exts.map((e) => e.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})$`, "i");
+  const files = readdirSync(jsDir).filter((f) => extRe.test(f) && f !== "_manifest.json" && f !== "_prune.json");
   const slices = chunk(files, sliceSize);
   const methodology = readFileSync(join(PROMPTS_DIR, "js-analyzer.md"), "utf8");
   const chain = minerModelChain();
