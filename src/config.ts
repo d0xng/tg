@@ -85,6 +85,35 @@ export function modelTag(model: string): string {
   return model.replace(/^claude-/, "").replace(/[^A-Za-z0-9.\-]/g, "-");
 }
 
+/**
+ * One hunter per lane that names a model. HUNTERn_MODEL unset keeps that lane's historical default;
+ * set to an empty string, "off" or "none" and the lane is dropped, so the pipeline runs with however
+ * many hunters are actually configured instead of always three.
+ */
+function hunterLanes(): AgentSpec[] {
+  const defaults = ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-6"];
+  const out: AgentSpec[] = [];
+  for (let i = 0; i < defaults.length; i++) {
+    const raw = process.env[`HUNTER${i + 1}_MODEL`];
+    const model = raw === undefined ? defaults[i]! : raw.trim();
+    if (!model || /^(off|none|disabled)$/i.test(model)) continue;
+    out.push({
+      role: `hunter-${modelTag(model)}`,
+      provider: providerForModel(model),
+      model,
+      effort: EFFORT,
+    } as AgentSpec);
+  }
+  if (!out.length) {
+    // Never leave the pipeline with nothing to hunt with: a run that reaches the hunting stage with an
+    // empty roster would silently produce no verdicts at all.
+    // console, not the log helper: config.ts is imported by everything and stays dependency-free.
+    console.warn(`[config] every hunter lane is disabled; falling back to one hunter on ${defaults[0]}`);
+    out.push({ role: `hunter-${modelTag(defaults[0]!)}`, provider: providerForModel(defaults[0]!), model: defaults[0]!, effort: EFFORT } as AgentSpec);
+  }
+  return out;
+}
+
 export const agents = {
   jsAnalyzer: {
     role: "js-analyzer",
@@ -105,11 +134,11 @@ export const agents = {
   // HUNTER1_MODEL=claude-opus-5-5@a with CLAUDE_OAUTH_A=..., HUNTER2_MODEL=claude-opus-5-5@b with
   // CLAUDE_OAUTH_B=... . modelTag turns the "@" into "-", so the role (and every finding's provenance
   // line and log filename) names the account that ran it: hunter-opus-5-5-a.
-  hunters: [
-    { role: `hunter-${modelTag(process.env.HUNTER1_MODEL ?? "claude-opus-5")}`,  provider: providerForModel(process.env.HUNTER1_MODEL ?? "claude-opus-5"),  model: process.env.HUNTER1_MODEL ?? "claude-opus-5",  effort: EFFORT },
-    { role: `hunter-${modelTag(process.env.HUNTER2_MODEL ?? "claude-opus-4-8")}`, provider: providerForModel(process.env.HUNTER2_MODEL ?? "claude-opus-4-8"), model: process.env.HUNTER2_MODEL ?? "claude-opus-4-8", effort: EFFORT },
-    { role: `hunter-${modelTag(process.env.HUNTER3_MODEL ?? "claude-opus-4-6")}`, provider: providerForModel(process.env.HUNTER3_MODEL ?? "claude-opus-4-6"), model: process.env.HUNTER3_MODEL ?? "claude-opus-4-6", effort: EFFORT },
-  ] as AgentSpec[],
+  // A lane set to an EMPTY value (HUNTER3_MODEL= in .env), or to "off"/"none", runs no hunter at all.
+  // That is the only way to hunt with fewer than three: the array used to be three literal entries, so
+  // clearing HUNTER3_MODEL just fell through to its default and you still got three. Useful when one
+  // provider's quota is spent and you want the lanes that remain to be the live ones.
+  hunters: hunterLanes(),
   // validator/reporter/recon: like the hunters, the provider follows the model id, so e.g.
   // VALIDATOR_MODEL=glm-5.3-flash in .env runs it on GLM. Defaults stay on opus.
   validator: {
