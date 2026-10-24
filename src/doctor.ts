@@ -21,7 +21,9 @@ async function main() {
   await check("claude", ["claude", "--version"]);
 
   console.log("\nroster:");
-  console.log(`  js-analyzer   codex   ${agents.jsAnalyzer.model}   effort=${agents.jsAnalyzer.effort}`);
+  // The provider is read off the spec instead of asserted: this line printed "codex" literally, which was
+  // already wrong whenever JS_MODEL named a claude id and became absurd once the miners moved to GLM.
+  console.log(`  js-analyzer   ${agents.jsAnalyzer.provider.padEnd(6)}  ${agents.jsAnalyzer.model}   effort=${agents.jsAnalyzer.effort}`);
   for (const h of agents.hunters) console.log(`  ${h.role.padEnd(13)} ${h.provider.padEnd(6)}  ${h.model}   effort=${h.effort}`);
   console.log(`  validator     ${agents.validator.provider}  ${agents.validator.model}`);
   console.log(`  reporter      ${agents.reporter.provider}  ${agents.reporter.model}`);
