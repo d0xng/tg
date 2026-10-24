@@ -9,3 +9,6 @@ _test-js/
 bun.lock
 rerun-miner.ts
 .telegram-offset
+hunt-notify.ts
+.env.bak*
+.claude/
