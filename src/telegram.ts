@@ -5,6 +5,15 @@ import { log, warn } from "./log.ts";
 
 const api = (method: string) => `https://api.telegram.org/bot${telegram.token}/${method}`;
 
+// Every Telegram call here is AWAITED at a stage boundary, so one that never returns stalls the whole
+// run: a notify between hunting and done held a run silent for 20 minutes until the watchdog declared
+// it dead and killed it. fetch has no default timeout, so each call carries its own. getUpdates is the
+// deliberate exception -- it is a 50s long poll, so its budget sits above that or the ingress would
+// abort on every quiet cycle. A timeout lands in the existing catch: it warns and the run continues.
+const MSG_TIMEOUT_MS = Number(process.env.TELEGRAM_MSG_TIMEOUT_MS ?? 20_000);
+const DOC_TIMEOUT_MS = Number(process.env.TELEGRAM_DOC_TIMEOUT_MS ?? 60_000);
+const POLL_TIMEOUT_MS = Number(process.env.TELEGRAM_POLL_TIMEOUT_MS ?? 70_000);
+
 // MarkdownV2 escaping: every one of these is reserved and must be backslash-escaped in dynamic text.
 // We compose messages from static labels (where we intend *bold*) plus escaped dynamic values.
 export function mdEscape(s: string): string {
@@ -20,6 +29,7 @@ export async function notify(text: string): Promise<void> {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: telegram.chatId, text, disable_web_page_preview: true }),
+      signal: AbortSignal.timeout(MSG_TIMEOUT_MS),
     });
   } catch (e) {
     warn("telegram notify failed:", String(e));
@@ -41,6 +51,7 @@ export async function notifyMd(text: string): Promise<void> {
         parse_mode: "MarkdownV2",
         disable_web_page_preview: true,
       }),
+      signal: AbortSignal.timeout(MSG_TIMEOUT_MS),
     });
     if (!res.ok) {
       // markup rejected -> resend as plain so the message still arrives
@@ -65,7 +76,11 @@ export async function sendDocument(filename: string, content: string, caption?: 
       form.append("caption", caption);
       form.append("parse_mode", "MarkdownV2");
     }
-    const res = await fetch(api("sendDocument"), { method: "POST", body: form });
+    const res = await fetch(api("sendDocument"), {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(DOC_TIMEOUT_MS),
+    });
     if (!res.ok) warn("telegram sendDocument failed:", res.status, await res.text().catch(() => ""));
   } catch (e) {
     warn("telegram sendDocument failed:", String(e));
@@ -106,7 +121,9 @@ export async function pollUpdates(onMessage: (text: string, chatId: number) => P
   log(`telegram ingress up (offset ${offset}); talk to the bot to start`);
   for (;;) {
     try {
-      const res = await fetch(api("getUpdates") + `?timeout=50&offset=${offset}`);
+      const res = await fetch(api("getUpdates") + `?timeout=50&offset=${offset}`, {
+        signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
+      });
       const data = (await res.json()) as any;
       for (const u of data.result ?? []) {
         offset = u.update_id + 1;
