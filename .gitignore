@@ -12,3 +12,19 @@ rerun-miner.ts
 hunt-notify.ts
 .env.bak*
 .claude/
+
+# Per-target scratch and PoC scripts from hunting sessions. These belong to one target and one
+# afternoon, not to the pipeline: probe/m<N> one-off scripts, captured pages, beautified bundles,
+# survey output. Anchored to the repo root so nothing under src/ can ever match by accident.
+/probe-*.mjs
+/m[0-9]*-*.mjs
+/scratch_*/
+/tools_m*/
+
+# Tool state generated on first run by projectdiscovery's goflags, not ours. provider-config.yaml is
+# where subfinder would keep its data-source API keys, so it stays out either way.
+/subfinder/
+/httpx/
+
+# npm's lockfile, for consistency with bun.lock above: this project does not version a lockfile.
+/package-lock.json
