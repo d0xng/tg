@@ -60,9 +60,8 @@ export async function runCodex(
     opts.sandbox ?? "workspace-write",
     "-m",
     spec.model,
-    "-c",
-    codexEffortConfig,
   ];
+  if (spec.effort) args.push("-c", codexEffortConfig(spec.effort));
   if (opts.outFile) args.push("-o", opts.outFile);
   args.push("-"); // read prompt from stdin
   log(`[${spec.role}] codex exec model=${spec.model} cwd=${opts.cwd}`);
@@ -97,6 +96,10 @@ export async function runClaude(
     tools.join(" "),
   ];
   for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
+  // Reasoning effort, only when the spec asks for one. Absent means the flag is not passed at all, which
+  // leaves the CLI's default in charge: asking for a level and not asking are different things, and this
+  // used to never be passed to claude at all.
+  if (spec.effort) args.push("--effort", spec.effort);
   // Build the environment explicitly on the subscription path so that (a) a tagged id swaps in that
   // account's OAuth token, letting two subscriptions run in parallel, and (b) a stray ANTHROPIC_API_KEY
   // or ANTHROPIC_AUTH_TOKEN can never silently take over: the CLI ranks API keys ABOVE the OAuth token,
@@ -122,7 +125,10 @@ export async function runClaude(
 // Run a model through the Claude Code CLI pointed at a third-party Anthropic-compatible endpoint, so
 // that model runs AGENTIC (reusing the claude harness's tools) for mining and hunting. We strip the
 // Max OAuth token and inject ANTHROPIC_BASE_URL + the provider's key, so this claude process talks to
-// the provider, not Anthropic. Shared by DeepSeek and GLM; the CLI has no effort flag on this path.
+// the provider, not Anthropic. Shared by DeepSeek and GLM. --effort DOES reach both of them: measured on
+// this rig, low vs max moves GLM's output tokens 456 -> 1125 and DeepSeek's 788 -> 1811, with latency
+// roughly doubling, so the flag is honoured through the compat shim even though neither provider reports
+// thinking_tokens back in its usage block.
 async function runAnthropicCompat(
   spec: AgentSpec,
   prompt: string,
@@ -133,6 +139,7 @@ async function runAnthropicCompat(
   const tools = opts.allowedTools ?? ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Task"];
   const args = ["claude", "-p", "--model", spec.model, "--output-format", "json", "--allowedTools", tools.join(" ")];
   for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
+  if (spec.effort) args.push("--effort", spec.effort);
   const envFull: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined && k !== "CLAUDE_CODE_OAUTH_TOKEN") envFull[k] = v;
@@ -146,7 +153,7 @@ async function runAnthropicCompat(
   return r;
 }
 
-// DeepSeek via its Anthropic-compatible endpoint. DeepSeek models default to "high" effort.
+// DeepSeek via its Anthropic-compatible endpoint.
 export function runDeepSeek(
   spec: AgentSpec,
   prompt: string,

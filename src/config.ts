@@ -6,16 +6,45 @@ export const RUNS_DIR = process.env.HUNTLINE_RUNS ?? join(ROOT, "runs");
 export const PROMPTS_DIR = join(ROOT, "prompts");
 
 export type Provider = "codex" | "claude" | "deepseek" | "glm";
-export type Effort = "low" | "medium" | "high" | "xhigh";
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+export const EFFORT_LEVELS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
 
 export interface AgentSpec {
   role: string;
   provider: Provider;
   model: string;
-  effort: Effort;
+  /**
+   * Reasoning effort, passed to the CLI as `--effort` (or codex's -c model_reasoning_effort). OPTIONAL
+   * and absent means "do not pass the flag", which leaves the CLI's own default in charge. That is the
+   * difference between asking for a level and not asking, and it is deliberate: measured on this rig,
+   * low vs max is a 2 to 3 times swing in output tokens and latency on claude, GLM and DeepSeek alike,
+   * while on a short reasoning task low was just as accurate as max. So only the hunters ask for a level.
+   */
+  effort?: Effort;
 }
 
-const EFFORT = (process.env.EFFORT as Effort) ?? "xhigh";
+/**
+ * The effort the HUNTERS run at, and only the hunters. Everything else deliberately sends no flag.
+ *
+ * Until now the `effort` field existed on every spec and was never read by cli.ts at all: the only thing
+ * that reached a provider was codex's -c override. So every hunter, validator, reporter and miner this
+ * pipeline has ever run went at the CLI's default, whatever EFFORT said.
+ *
+ * HUNTER_EFFORT (falling back to EFFORT, then xhigh) sets it. Set it to an empty value, or to
+ * "default"/"off"/"none", and no flag is passed, which is how you go back to the previous behaviour
+ * without touching code.
+ */
+function hunterEffort(): Effort | undefined {
+  const raw = (process.env.HUNTER_EFFORT ?? process.env.EFFORT ?? "xhigh").trim().toLowerCase();
+  if (!raw || /^(default|off|none)$/.test(raw)) return undefined;
+  if (!(EFFORT_LEVELS as string[]).includes(raw)) {
+    // console, not the log helper: config.ts is imported by everything and stays dependency-free.
+    console.warn(`[config] HUNTER_EFFORT "${raw}" is not one of ${EFFORT_LEVELS.join("|")}; passing no effort flag`);
+    return undefined;
+  }
+  return raw as Effort;
+}
+const HUNTER_EFFORT = hunterEffort();
 
 export const telegram = {
   token: process.env.TELEGRAM_BOT_TOKEN ?? "",
@@ -26,10 +55,12 @@ export const chrome = {
   bin: process.env.CHROME_BIN ?? "google-chrome",
 };
 
-// Codex takes reasoning effort as a -c config override. The exact key is verified in doctor.ts;
-// keep it overridable so a wrong guess never silently breaks a run.
-export const codexEffortConfig =
-  process.env.CODEX_EFFORT_CONFIG ?? `model_reasoning_effort="${EFFORT}"`;
+// Codex takes reasoning effort as a -c config override rather than a flag. Built per level now that the
+// level is per spec instead of global, and only used when a spec actually asks for one. The exact key is
+// verified in doctor.ts; keep it overridable so a wrong guess never silently breaks a run.
+export function codexEffortConfig(effort: Effort): string {
+  return process.env.CODEX_EFFORT_CONFIG ?? `model_reasoning_effort="${effort}"`;
+}
 
 // DeepSeek via its Anthropic-compatible endpoint, driven agentically through the Claude Code CLI.
 export const deepseek = {
@@ -101,7 +132,7 @@ function hunterLanes(): AgentSpec[] {
       role: `hunter-${modelTag(model)}`,
       provider: providerForModel(model),
       model,
-      effort: EFFORT,
+      effort: HUNTER_EFFORT,
     } as AgentSpec);
   }
   if (!out.length) {
@@ -109,7 +140,7 @@ function hunterLanes(): AgentSpec[] {
     // empty roster would silently produce no verdicts at all.
     // console, not the log helper: config.ts is imported by everything and stays dependency-free.
     console.warn(`[config] every hunter lane is disabled; falling back to one hunter on ${defaults[0]}`);
-    out.push({ role: `hunter-${modelTag(defaults[0]!)}`, provider: providerForModel(defaults[0]!), model: defaults[0]!, effort: EFFORT } as AgentSpec);
+    out.push({ role: `hunter-${modelTag(defaults[0]!)}`, provider: providerForModel(defaults[0]!), model: defaults[0]!, effort: HUNTER_EFFORT } as AgentSpec);
   }
   return out;
 }
@@ -123,7 +154,8 @@ export const agents = {
     // analyzing stage was unaffected, but anything using this spec directly got a confusing failure.
     provider: providerForModel(process.env.JS_MODEL ?? "deepseek-flash"),
     model: process.env.JS_MODEL ?? "deepseek-flash", // DeepSeek-V4.1-Flash by default (1M ctx)
-    effort: "high",
+    // No effort: the miners read JS and write leads, which is volume work rather than puzzle solving,
+    // and raising the level only measurably raised tokens and latency.
   } as AgentSpec,
   // Leads are dealt round-robin across these hunters, one lead per hunter, each hunter in its own
   // parallel lane (see hunter.ts). The roster is model-id driven -- providerForModel routes each id, so a
@@ -145,19 +177,16 @@ export const agents = {
     role: "validator",
     provider: providerForModel(process.env.VALIDATOR_MODEL ?? "claude-opus-4-8"),
     model: process.env.VALIDATOR_MODEL ?? "claude-opus-4-8",
-    effort: EFFORT,
   } as AgentSpec,
   reporter: {
     role: "reporter",
     provider: providerForModel(process.env.REPORTER_MODEL ?? "claude-opus-4-6"),
     model: process.env.REPORTER_MODEL ?? "claude-opus-4-6",
-    effort: EFFORT,
   } as AgentSpec,
   recon: {
     role: "recon",
     provider: providerForModel(process.env.RECON_MODEL ?? "claude-opus-4-6"),
     model: process.env.RECON_MODEL ?? "claude-opus-4-6", // conversational front desk; override to a lighter model to cut chat cost
-    effort: EFFORT,
   } as AgentSpec,
 };
 
