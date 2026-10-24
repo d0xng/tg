@@ -9,12 +9,15 @@ CollectMode=inactive-or-failed
 Type=simple
 WorkingDirectory=/opt/huntline
 Environment=HOME=/root
-Environment=PATH=/root/.npm-global/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/root/.npm-global/bin/bun run src/cli-entry.ts %I
+# One file for every box: bun lives in /root/.npm-global/bin on one and /usr/local/bin on another, so
+# ExecStart resolves it from PATH through env (an absolute path, which is what systemd requires) instead
+# of hardcoding a location that is wrong on half the fleet.
+Environment=PATH=/root/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/env bun run src/cli-entry.ts %I
 # A run that dies must NOT come back by itself: an auto-restart would re-crawl and re-spend tokens.
 Restart=no
-# SIGTERM goes to the orchestrator alone so it can mark the run and reap its own agents; anything
-# still alive after the grace period is SIGKILLed with the cgroup.
+# SIGTERM goes to the orchestrator alone so it can mark the run and reap its own agents; anything still
+# alive after the grace period is SIGKILLed with the cgroup.
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=120
