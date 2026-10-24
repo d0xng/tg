@@ -1,0 +1,23 @@
+[Unit]
+Description=huntline run: %I
+After=network-online.target
+Wants=network-online.target
+# The unit removes itself once it is done, so systemctl does not fill up with dead instances.
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/huntline
+Environment=HOME=/root
+Environment=PATH=/root/.npm-global/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/.npm-global/bin/bun run src/cli-entry.ts %I
+# A run that dies must NOT come back by itself: an auto-restart would re-crawl and re-spend tokens.
+Restart=no
+# SIGTERM goes to the orchestrator alone so it can mark the run and reap its own agents; anything
+# still alive after the grace period is SIGKILLed with the cgroup.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=huntline-run
