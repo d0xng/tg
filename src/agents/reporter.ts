@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { agents, caps, PROMPTS_DIR, timeouts } from "../config.ts";
 import { failureSummary, runAgentChecked } from "../cli.ts";
-import { verdictOf } from "./validator.ts";
+import { verdictOf } from "../util/verdict.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";

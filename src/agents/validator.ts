@@ -4,6 +4,7 @@ import { agents, caps, PROMPTS_DIR, timeouts } from "../config.ts";
 import { failureSummary, runAgentChecked } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
+import { DECIDED, verdictOf } from "../util/verdict.ts";
 import type { Run } from "../run.ts";
 
 export interface ValidationResult {
@@ -37,20 +38,6 @@ function isOpenRedirect(file: string, content: string): boolean {
     /^\s*class:\s*[^\n]*redirect/im.test(content)
   );
 }
-/**
- * The verdict a file DECLARES: the first `VERDICT:` token in it, uppercased. Testing the whole file
- * once per outcome is wrong, and real data proves it: one saudiacargo verdict is VALID while its body
- * carries "VERDICT:" at the end of a line and "SKIPPED" at the start of the next, and JS `\s*` crosses
- * the newline (grep, being line based, does not), so a SKIPPED test matched a VALID verdict and silently
- * dropped a payable finding from the count. The reporter uses this too, so both stages always agree on
- * which findings are VALID.
- */
-export function verdictOf(content: string): string {
-  return (content.match(/VERDICT:\s*([A-Za-z-]+)/i)?.[1] ?? "").toUpperCase();
-}
-
-const DECIDED = new Set(["VALID", "INVALID", "NEEDS-FIX", "SKIPPED"]);
-
 function shouldValidate(file: string, content: string): boolean {
   const sev = severityOf(content);
   if (sev === "medium" || sev === "high" || sev === "critical") return true;

@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { RUNS_DIR } from "./config.ts";
 import { liveRunDirs, ownerAlive, runActivityAgeMin, killRunProcesses } from "./util/procs.ts";
+import { owesWork, pendingWork } from "./pending.ts";
 import { notify } from "./telegram.ts";
 import { log } from "./log.ts";
 
@@ -27,6 +28,8 @@ const ALERT_FRESH_MIN = Number(process.env.WATCHDOG_ALERT_FRESH_MIN ?? 120);
 // silence it is reported instead, so the operator can look. Killing on a guess is the failure this
 // whole mechanism exists to stop.
 const SILENT_MIN = Number(process.env.WATCHDOG_SILENT_MIN ?? 90);
+// How many owed runs to name in one message before collapsing the rest into a count.
+const PENDING_LIST_MAX = Number(process.env.WATCHDOG_PENDING_LIST_MAX ?? 8);
 const TERMINAL = new Set(["done", "error"]);
 
 async function main() {
@@ -40,6 +43,12 @@ async function main() {
   const running: string[] = [];
   const freshStalls: string[] = [];
   const silent: string[] = [];
+  // Finished runs that still owe validations or reports. Detection is automatic; SPENDING is not, on
+  // purpose: an auto-resume would burn the whole backlog unasked, and worse, resuming old runs while a
+  // fresh one is in flight makes both compete for the same subscription and hit the very session limit
+  // this is recovering from. So the cron finds the work and hands over the command; the operator decides.
+  const owed: string[] = [];
+  let owedMore = 0;
   let wedged = 0;
 
   for (const d of dirs) {
@@ -50,7 +59,25 @@ async function main() {
     } catch {
       continue; // unreadable run.json, skip
     }
-    if (TERMINAL.has(st.stage)) continue;
+    if (TERMINAL.has(st.stage)) {
+      // A finished run can still owe work: a 429 leaves findings unvalidated and VALID findings
+      // unreported, and nothing ever came back to them because nobody knew. Say it once.
+      if (!st.pendingNotifiedAt) {
+        const p = pendingWork(full);
+        if (owesWork(p)) {
+          const line = `- ${st.domain}: ${p.needValidation.length} to validate, ${p.needReport.length} VALID without a report  [${d}]`;
+          if (owed.length < PENDING_LIST_MAX) owed.push(line);
+          else owedMore++;
+          try {
+            st.pendingNotifiedAt = new Date().toISOString();
+            writeFileSync(join(full, "run.json"), JSON.stringify(st, null, 2));
+          } catch {
+            /* unwritable run.json: it will be reported again next pass, which is the safe direction */
+          }
+        }
+      }
+      continue;
+    }
 
     const age = runActivityAgeMin(full);
 
@@ -95,15 +122,21 @@ async function main() {
   // Heartbeat to the LOG only (never Telegram): one line per pass so `tail huntline-watchdog.log` proves
   // the cron is alive even when there is nothing to report.
   log(
-    `[watchdog] pass: running=${running.length} wedged=${wedged} fresh-alert=${freshStalls.length} silent=${silent.length}`,
+    `[watchdog] pass: running=${running.length} wedged=${wedged} fresh-alert=${freshStalls.length} silent=${silent.length} owed=${owed.length + owedMore}`,
   );
 
-  if (freshStalls.length || silent.length) {
+  if (freshStalls.length || silent.length || owed.length) {
     const body: string[] = [];
     if (freshStalls.length) body.push("Watchdog: run(s) stopped making progress and were marked dead:", ...freshStalls);
     if (silent.length) {
       if (body.length) body.push("");
       body.push("Watchdog: run(s) still owned by a live process but quiet for a long time (NOT touched):", ...silent);
+    }
+    if (owed.length) {
+      if (body.length) body.push("");
+      body.push("Watchdog: finished run(s) that still owe work (reported once, nothing was spent):", ...owed);
+      if (owedMore) body.push(`- (+${owedMore} more)`);
+      body.push("", "To do only what is missing, from /opt/huntline:", "  bun run src/resume-run.ts <runId> --dry-run   # see the cost first", "  bun run src/resume-run.ts <runId>");
     }
     body.push("", running.length ? "Still running: " + running.join(", ") : "No run is currently active.");
     await notify(body.join("\n"));

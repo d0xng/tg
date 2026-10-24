@@ -39,6 +39,12 @@ export interface RunState {
    * "is the owner alive" instead of inferring death from the absence of recent file writes.
    */
   owner?: { pid: number; startedAt: number };
+  /**
+   * When the watchdog last told the operator this finished run still owes validations or reports. Set
+   * once so the same backlog is not announced every five minutes; cleared by nothing, because a run that
+   * has been reported and then resumed ends up owing nothing and drops out of the scan on its own.
+   */
+  pendingNotifiedAt?: string;
 }
 
 // The funnel on disk. Every stage reads the previous stage's directory and writes its own.
