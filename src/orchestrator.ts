@@ -10,6 +10,7 @@ import { notifyMd, sendDocument, mdEscape } from "./telegram.ts";
 import { jsonl, log, err as logErr } from "./log.ts";
 import { timeouts } from "./config.ts";
 import { killRunProcesses } from "./util/procs.ts";
+import { stopReason, stopRequested } from "./util/stopflag.ts";
 import { Run } from "./run.ts";
 
 // The orchestrator sequences the full assembly line for ONE host and reports to Telegram at every phase
@@ -55,6 +56,13 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
       `${stage}: ${f.length} agent invocation(s) produced no result (${f.join("; ")}). The stage is INCOMPLETE, not negative: re-run it with the matching src/*-run.ts once the limit resets.`,
     );
   };
+  // A stop asked for by the operator (Telegram `stop <id>` or src/stop-run.ts). Checked between stages,
+  // which is the half that makes a cooperative stop land: the stopper kills the current stage's agents so
+  // the awaited call returns at once, and this refuses to begin the next stage.
+  const bailIfStopped = (stage: string): void => {
+    if (!stopRequested(run.dir)) return;
+    throw new Error(`${stage}: ${stopReason(run.dir) || "stopped by operator"}`);
+  };
   try {
     // Stage 1 - browser-operator (unauthenticated crawl + JS capture + chunk pre-fetch)
     run.setStage("crawling");
@@ -62,6 +70,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
       idleNoNewJsMs: timeouts.crawlIdleMs,
       maxMs: timeouts.crawlMaxMs,
       maxPages: timeouts.crawlMaxPages,
+      shouldStop: () => stopRequested(run.dir),
     });
     run.state.counts.jsFiles = jsFiles;
     run.save();
@@ -74,6 +83,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
     }
 
     // Stage 2 - js-miners (parallel readers emit leads)
+    bailIfStopped("crawling");
     run.setStage("analyzing");
     // Enrich the corpus first: recover the original sources from any .map the crawl captured (the
     // crawler has always downloaded them and nothing ever read them), and beautify what is left, so
@@ -111,6 +121,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
     }
 
     // Stage 3 - hunters (exploit leads into candidate findings)
+    bailIfStopped("analyzing");
     run.setStage("hunting");
     await runHunters(run);
     const findingFiles = run.listMd("findings");
@@ -126,6 +137,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
     );
 
     // Stage 4 - validator (clean-session re-verification + CVSS; kills false positives)
+    bailIfStopped("hunting");
     run.setStage("validating");
     const v = await runValidator(run);
     const extra =
@@ -143,6 +155,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
     }
 
     // Stage 5 - reporter (submission-ready reports, re-verified; sent as .md attachments)
+    bailIfStopped("validating");
     run.setStage("reporting");
     await runReporter(run);
     const reportFiles = run.listMd("reports");
@@ -158,6 +171,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
     }
     // Everything that could be produced has been. If any invocation along the way produced no result,
     // this run is incomplete and says so instead of reading as a clean finish.
+    bailIfStopped("reporting");
     bailIfAgentsFailed("run");
     run.setStage("done");
     jsonl(run.logFile, { event: "run:done", findings: findingFiles.length, valid: v.valid, reports: reportFiles.length });

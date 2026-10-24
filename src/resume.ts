@@ -2,6 +2,7 @@ import { runReporter } from "./agents/reporter.ts";
 import { runValidator } from "./agents/validator.ts";
 import { owesWork, pendingWork, type Pending } from "./pending.ts";
 import { log, warn } from "./log.ts";
+import { clearStop } from "./util/stopflag.ts";
 import type { Run } from "./run.ts";
 
 // The resume itself, as a function, because two callers drive it: the CLI (src/resume-run.ts) and the
@@ -42,6 +43,9 @@ export async function resumeRun(run: Run): Promise<ResumeResult> {
     return { ok: true, before, after: before, failures: [], seconds: 0, noop: true };
   }
 
+  // A run that was stopped carries the sentinel, and resuming it means withdrawing that stop: without
+  // this the first stage boundary would abort on a flag left behind by a decision already reversed.
+  clearStop(run.dir);
   // Own the run while we work, so the watchdog sees a live owner instead of inferring death, and start
   // from a clean failure list: what matters afterwards is what failed on THIS attempt.
   run.claim();

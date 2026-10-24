@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, statSync, rmSync, existsSync } from "fs";
 import { agents, PROMPTS_DIR, timeouts, type AgentSpec } from "../config.ts";
 import { failureSummary, runAgentChecked, type AgentFailure } from "../cli.ts";
 import { jsonl, log, warn } from "../log.ts";
+import { stopRequested } from "../util/stopflag.ts";
 import type { Run } from "../run.ts";
 
 // The hunter stage: each lead is worked by ONE hunter, in depth. Leads are dealt round-robin across the
@@ -31,7 +32,15 @@ export async function runHunters(run: Run): Promise<number> {
 
   await Promise.all(
     lanes.map(async ({ spec, leads }) => {
-      for (const leadFile of leads) await huntLead(run, spec, leadFile, methodology);
+      for (const leadFile of leads) {
+        // A stop request lands here: the stopper already killed the agent working the current lead, so
+        // this is what keeps the lane from immediately starting the next one.
+        if (stopRequested(run.dir)) {
+          log(`[hunters] ${tagOf(spec)}: stop requested, ${leads.length} lead(s) in this lane not started`);
+          break;
+        }
+        await huntLead(run, spec, leadFile, methodology);
+      }
     }),
   );
 

@@ -3,6 +3,7 @@ import { join } from "path";
 import { agents, caps, PROMPTS_DIR, timeouts } from "../config.ts";
 import { failureSummary, runAgentChecked } from "../cli.ts";
 import { verdictOf } from "../util/verdict.ts";
+import { stopRequested } from "../util/stopflag.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
@@ -37,6 +38,7 @@ export async function runReporter(run: Run): Promise<number> {
   jsonl(run.logFile, { stage: "reporting", event: "reporter:start", findings: todo.length, reused });
 
   const tasks = todo.map((f) => async () => {
+    if (stopRequested(run.dir)) return; // stop requested: do not start another report
     const base = f.replace(/\.md$/, "");
     const finding = readFileSync(join(run.sub("findings"), f), "utf8");
     const verdict = readFileSync(join(vdir, base + ".md"), "utf8");

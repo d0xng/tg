@@ -3,12 +3,13 @@ import { join } from "path";
 import { agents, PROMPTS_DIR, RUNS_DIR } from "../config.ts";
 import { runAgent } from "../cli.ts";
 import { notify } from "../telegram.ts";
-import { expandScope } from "../recon/expand.ts";
+import { expandTargets } from "../recon/expand.ts";
 import { Run } from "../run.ts";
 import { orchestrate } from "../orchestrator.ts";
 import { liveRunDirs, ownerAlive, runActivityAgeMin } from "../util/procs.ts";
 import { owesWork, pendingWork } from "../pending.ts";
 import { pendingLines, resumeRun, resumeSummary } from "../resume.ts";
+import { findRuns, stopRun, stopSummary } from "../stop.ts";
 import { log, warn } from "../log.ts";
 
 // The recon agent is the conversational front of the pipeline. Each Telegram message is appended to a
@@ -117,6 +118,7 @@ export function owedReport(): string {
 }
 
 const DRY = /^(dry|dry-run|--dry-run)$/i;
+const ALL = /^(all|--all)$/i;
 
 export async function handleMessage(text: string, chatId: number): Promise<void> {
   // Status command: answered instantly from disk, never routed to the recon LLM, never touches busy,
@@ -126,6 +128,46 @@ export async function handleMessage(text: string, chatId: number): Promise<void>
     await notify(statusReport());
     return;
   }
+  // Stop, answered without the LLM like `status`: the point of it is the moment you change your mind and
+  // want the subscription back, so it cannot wait behind an LLM turn.
+  //   stop                     -> what is running, and how to stop it
+  //   stop <runId|domain>      -> stop the newest run still going for that
+  //   stop <runId|domain> all  -> stop every run still going for that
+  const stopTok = text.trim().replace(/^\//, "").split(/\s+/);
+  if (stopTok[0] && stopTok[0].toLowerCase() === "stop") {
+    const args = stopTok.slice(1);
+    const all = args.some((a) => ALL.test(a));
+    const needle = args.find((a) => !ALL.test(a));
+    if (!needle) {
+      await notify([statusReport(), "", 'Send "stop <runId or domain>" to stop one, or add "all" for every run on that domain.'].join("\n"));
+      return;
+    }
+    const matches = findRuns(needle);
+    if (!matches.length) {
+      await notify(`Nothing matches "${needle}". Send "status" to see what is running.`);
+      return;
+    }
+    const live = matches.filter((m) => !m.terminal);
+    if (!live.length) {
+      await notify(
+        [`${matches.length} run(s) match "${needle}" and all of them are already finished:`, ...matches.slice(0, 6).map((m) => `- ${m.stage}: ${m.id}`)].join("\n"),
+      );
+      return;
+    }
+    const targets = all ? live : [live[0]];
+    const head = live.length > 1 && !all ? [`${live.length} runs are still going; stopping the newest. Add "all" for every one.`] : [];
+    const lines: string[] = [];
+    for (const m of targets) {
+      try {
+        lines.push(stopSummary(await stopRun(m.id)));
+      } catch (e) {
+        lines.push(`${m.id}: stop failed, ${String(e)}`);
+      }
+    }
+    await notify([...head, ...lines].join("\n"));
+    return;
+  }
+
   // Resume, answered without the LLM like `status`. The watchdog's "this run owes work" alert arrives in
   // this chat, on a phone, so acting on it has to be possible from here instead of requiring an ssh
   // session. Parsed from the RAW text and never from the lowercased copy, because a run id carries an
@@ -246,20 +288,11 @@ async function launch(dir: { hosts?: string[]; wildcards?: string[] }): Promise<
   }
   busy = true;
   try {
-    const hosts = new Set<string>();
-    for (const h of dir.hosts ?? []) {
-      const t = h.trim();
-      if (t) hosts.add(/^https?:\/\//i.test(t) ? t : "https://" + t);
-    }
-    for (const w of dir.wildcards ?? []) {
-      const root = w.replace(/^\*\./, "").replace(/^https?:\/\//i, "").trim();
-      if (!root) continue;
-      await notify(`Recon: expanding *.${root} with subfinder | httpx ...`);
-      const live = await expandScope(root);
-      await notify(`Recon: *.${root} resolved to ${live.length} live host(s).`);
-      for (const h of live) hosts.add(h);
-    }
-    const list = [...hosts];
+    // Same expansion the terminal uses, so a wildcard resolves identically on both paths.
+    const list = await expandTargets(
+      [...(dir.hosts ?? []), ...(dir.wildcards ?? []).map((w) => (w.includes("*") ? w : `*.${w}`))],
+      (m) => notify(`Recon: ${m}`),
+    );
     if (!list.length) {
       await notify("No live hosts to hunt.");
       return;

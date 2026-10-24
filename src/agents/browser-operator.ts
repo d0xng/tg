@@ -40,6 +40,7 @@ interface CrawlOpts {
   maxPages?: number; // safety cap on distinct pages visited (default 20000)
   idleMs?: number; // quiet period that counts as "network idle"
   idleMaxWaitMs?: number; // cap on how long we wait for idle per page
+  shouldStop?: () => boolean; // the operator asked for this run to stop; abandon the walk at the next page
 }
 
 class CDP {
@@ -156,7 +157,12 @@ function fileNameFor(url: string, used: Set<string>): string {
   return name;
 }
 
-async function launchChrome(): Promise<{ proc: Bun.Subprocess; port: number; profile: string }> {
+// `cwd` is the run's own js directory, which is NOT where Chrome reads anything from: --user-data-dir is
+// absolute and Chrome ignores the working directory. It is set so this process and its renderers carry a
+// cwd INSIDE the run dir, which is the marker killRunProcesses matches on. Without it the crawl's Chrome
+// inherited the repo root, was invisible to both the reaper and the liveness check, and a killed run left
+// a 150 MB profile and a process tree behind: ten of them, 1.5 GB, were sitting on one box.
+async function launchChrome(cwd?: string): Promise<{ proc: Bun.Subprocess; port: number; profile: string }> {
   const port = 9222 + Math.floor(Math.random() * 2000);
   const profile = join(import.meta.dir, "..", "..", `.chrome-${port}`);
   mkdirSync(profile, { recursive: true });
@@ -180,7 +186,7 @@ async function launchChrome(): Promise<{ proc: Bun.Subprocess; port: number; pro
       "--user-data-dir=" + profile,
       "about:blank",
     ],
-    { stdout: "ignore", stderr: "ignore" },
+    { stdout: "ignore", stderr: "ignore", cwd },
   );
   return { proc, port, profile };
 }
@@ -240,7 +246,7 @@ export async function crawl(
     }
   };
 
-  const { proc, port, profile } = await launchChrome();
+  const { proc, port, profile } = await launchChrome(jsDir);
   let cdp: CDP | null = null;
   const manifest: Record<string, string> = {};
   const usedNames = new Set<string>();
@@ -604,6 +610,10 @@ export async function crawl(
 
     enqueue(startUrl);
     while (true) {
+      if (opts.shouldStop?.()) {
+        log("[browser-operator] stop requested, abandoning the walk");
+        break;
+      }
       if (Date.now() - lastNewJs > idleNoNewJsMs) break; // no new on-target artifact for the idle window
       if (Date.now() > hardDeadline) break; // safety ceiling
       if (pages >= maxPages) break;

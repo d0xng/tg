@@ -5,6 +5,7 @@ import { failureSummary, runAgentChecked } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import { DECIDED, verdictOf } from "../util/verdict.ts";
+import { stopRequested } from "../util/stopflag.ts";
 import type { Run } from "../run.ts";
 
 export interface ValidationResult {
@@ -95,6 +96,7 @@ export async function runValidator(run: Run): Promise<ValidationResult> {
   // Findings whose validator never ran. Their verdict is unknown, not negative.
   const failedFiles = new Set<string>();
   const tasks = toValidate.map((f) => async () => {
+    if (stopRequested(run.dir)) return; // stop requested: do not start another validation
     const base = f.replace(/\.md$/, "");
     const content = readFileSync(join(run.sub("findings"), f), "utf8");
     const prompt = [
