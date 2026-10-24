@@ -39,6 +39,19 @@ function titleOf(run: Run, sub: "leads" | "findings", file: string): string {
 export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise<void> {
   const dom = () => mdEscape(run.state.domain);
   jsonl(run.logFile, { event: "run:start", domain: run.state.domain });
+  // A stage whose agents never produced a result has told us NOTHING about the target, so the run must
+  // not end `done`. Called before every "nothing here" exit and before the final done: that is what
+  // stops a 429 session limit from being filed as "no bugs on this target", which is exactly what
+  // happened to six uber.com candidates on 2026-10-22. The throw lands in the catch below, which marks
+  // the run `error` and names the reason, and run.json keeps the list so the right src/*-run.ts can
+  // finish the job once the limit resets.
+  const bailIfAgentsFailed = (stage: string): void => {
+    const f = run.state.failures ?? [];
+    if (!f.length) return;
+    throw new Error(
+      `${stage}: ${f.length} agent invocation(s) produced no result (${f.join("; ")}). The stage is INCOMPLETE, not negative: re-run it with the matching src/*-run.ts once the limit resets.`,
+    );
+  };
   try {
     // Stage 1 - browser-operator (unauthenticated crawl + JS capture + chunk pre-fetch)
     run.setStage("crawling");
@@ -89,6 +102,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
       await sendDocument(`leads-${run.state.domain}.md`, body);
     }
     if (leads === 0) {
+      bailIfAgentsFailed("analyzing");
       run.setStage("done");
       return;
     }
@@ -98,6 +112,7 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
     await runHunters(run);
     const findingFiles = run.listMd("findings");
     if (!findingFiles.length) {
+      bailIfAgentsFailed("hunting");
       await notifyMd(`*Hunting done* ${EMDASH} ${dom()}\n${mdEscape("no candidate findings")}`);
       run.setStage("done");
       return;
@@ -110,11 +125,16 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
     // Stage 4 - validator (clean-session re-verification + CVSS; kills false positives)
     run.setStage("validating");
     const v = await runValidator(run);
-    const extra = v.skipped ? ` ${DOT} ${v.skipped} skipped (low/info)` : "";
+    const extra =
+      (v.skipped ? ` ${DOT} ${v.skipped} skipped (low/info)` : "") +
+      (v.failed ? ` ${DOT} ${v.failed} NEVER VALIDATED (agent produced no result)` : "");
     await notifyMd(
       `*Validation done* ${EMDASH} ${dom()}\n${mdEscape(`${v.valid} confirmed ${DOT} ${v.invalid} dropped${extra}`)}`,
     );
     if (v.valid === 0) {
+      // Before concluding there is nothing to report: if validators never ran, `valid === 0` is a
+      // statement about the quota, not about the findings.
+      bailIfAgentsFailed("validating");
       run.setStage("done");
       return;
     }
@@ -133,6 +153,9 @@ export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise
         /* a failed attachment must not fail the run */
       }
     }
+    // Everything that could be produced has been. If any invocation along the way produced no result,
+    // this run is incomplete and says so instead of reading as a clean finish.
+    bailIfAgentsFailed("run");
     run.setStage("done");
     jsonl(run.logFile, { event: "run:done", findings: findingFiles.length, valid: v.valid, reports: reportFiles.length });
   } catch (e) {

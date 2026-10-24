@@ -24,6 +24,15 @@ export interface RunState {
   counts: { jsFiles: number; leads: number; findings: number };
   findingsByType: Record<string, number>;
   error?: string;
+  /**
+   * Agent invocations that never produced a RESULT: a 429 session limit, a provider overload, a
+   * timeout. These are NOT findings about the target, and the difference is the whole point: a
+   * validator that 429s used to be tallied as "invalid", which turned a quota error into a verdict of
+   * "false positive" and let the run finish as `done`. Six Uber candidates were written off that way
+   * on 2026-10-22. Anything in here means the stage's result is incomplete, so the run must not end
+   * `done`, and whatever is listed is worth re-running once the limit resets.
+   */
+  failures?: string[];
 }
 
 // The funnel on disk. Every stage reads the previous stage's directory and writes its own.
@@ -84,6 +93,16 @@ export class Run {
 
   setStage(s: Stage): void {
     this.state.stage = s;
+    this.save();
+  }
+
+  // Record an agent invocation that failed to produce a result, and persist it immediately: run.json is
+  // what a later `validate-run`/`report-run` reads to know what still needs doing, and what the operator
+  // sees when a run ends `error`. Deduped, because six validators hitting the same session limit is one
+  // fact, not six.
+  noteFailure(msg: string): void {
+    const f = this.state.failures ?? (this.state.failures = []);
+    if (!f.includes(msg)) f.push(msg);
     this.save();
   }
 

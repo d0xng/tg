@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { agents, PROMPTS_DIR, timeouts, providerForModel, type AgentSpec } from "../config.ts";
-import { runAgent, type CliResult } from "../cli.ts";
+import { agentFailure, failureSummary, runAgent, type CliResult } from "../cli.ts";
 import { runLimited } from "../util/pool.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
@@ -96,7 +96,15 @@ export async function runJsMiners(
       jsonl(run.logFile, { stage: "analyzing", event: "miner:retry", miner: i, model, exit: res.code, timedOut: res.timedOut, next });
     }
     jsonl(run.logFile, { stage: "analyzing", event: "miner:done", miner: i, exit: res?.code ?? -1, model: used, files: slice.length });
-    if (!res || res.code !== 0) warn(`[js-miners] miner ${i} exhausted model chain (${slice.length} files)`);
+    // Chain exhausted: this slice of the corpus was never read by anybody. It used to be a warn and
+    // nothing else, so a run whose every miner ran out of quota still reported "0 leads" and finished
+    // `done` -- a statement about the subscription dressed up as a statement about the target. Record it
+    // so the orchestrator refuses to call the run clean and `analyze-run` can redo the slice later.
+    const f = res ? agentFailure(res) : { reason: "no attempt", retryNow: false };
+    if (f) {
+      run.noteFailure(`${failureSummary(`miner ${i}`, f)} after ${chain.length} model(s), ${slice.length} file(s) unread`);
+      warn(`[js-miners] miner ${i} exhausted model chain on ${f.reason} (${slice.length} files unread)`);
+    }
   });
   await runLimited(tasks, concurrency);
 

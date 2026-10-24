@@ -165,6 +165,102 @@ export function runGLM(
   return runAnthropicCompat(spec, prompt, opts, glm, "glm");
 }
 
+export interface AgentFailure {
+  /** Short reason: "usage_limit_reached", "api 503", "timeout", "exit 1". */
+  reason: string;
+  /** The CLI's own sentence when it gave one, e.g. "You've hit your session limit, resets 2:30am (UTC)". */
+  detail?: string;
+  /** Worth ONE immediate retry on the same model (overload, capacity, 5xx) vs pointless (a quota that resets hours from now). */
+  retryNow: boolean;
+}
+
+// The claude CLI with --output-format json prints one result object. Parse it tolerantly: a stray line
+// before it, or a codex run with a different output shape, must never throw here.
+function parseResult(stdout: string): Record<string, any> | null {
+  const s = (stdout ?? "").trim();
+  if (!s) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    /* maybe there is noise around it */
+  }
+  for (const line of s.split("\n").reverse()) {
+    const l = line.trim();
+    if (l.startsWith("{") && l.endsWith("}")) {
+      try {
+        return JSON.parse(l);
+      } catch {
+        /* keep looking */
+      }
+    }
+  }
+  return null;
+}
+
+// Momentarily unable, as opposed to out of quota for hours.
+const RETRY_NOW = /overloaded|capacity|rate_limit|unavailable|internal|gateway|temporarily/i;
+
+/**
+ * Did this invocation fail to produce a RESULT, as opposed to running and concluding nothing?
+ *
+ * This is the distinction the pipeline used to lose, and it was expensive. Every stage decides its
+ * outcome from the artifact the agent wrote (`existsSync(verdicts/x.md)`, `existsSync(findings/x.md)`),
+ * so an agent that never ran looks exactly like an agent that ran and found nothing. On 2026-10-22 six
+ * validator invocations on uber.com returned in half a second with
+ * `api_error_status: 429, api_error: "usage_limit_reached"`, were tallied as six false positives, and
+ * the run finished `done`. Run every result through this and the two cases separate.
+ */
+export function agentFailure(res: CliResult): AgentFailure | null {
+  if (res.timedOut) return { reason: "timeout", retryNow: true };
+  const o = parseResult(res.stdout);
+  const status = o && typeof o.api_error_status === "number" ? o.api_error_status : 0;
+  const name = o && typeof o.api_error === "string" ? o.api_error : "";
+  const terminal = o && typeof o.terminal_reason === "string" ? o.terminal_reason : "";
+  if (status || name || terminal === "api_error") {
+    const reason = name || (status ? `api ${status}` : "api_error");
+    const detail = o && typeof o.result === "string" ? o.result.trim().slice(0, 200) : undefined;
+    // A session/usage limit resets hours later, so retrying in a minute just spends another call on the
+    // same wall. Everything else in the 429/5xx family is worth exactly one more try.
+    const retryNow =
+      !/usage_limit|quota/i.test(reason) && (RETRY_NOW.test(reason) || status >= 500 || status === 429);
+    return { reason, detail, retryNow };
+  }
+  if (res.code !== 0) return { reason: `exit ${res.code}`, retryNow: false };
+  return null;
+}
+
+/** One line for run.json and the Telegram error, naming the role and what the provider said. */
+export function failureSummary(role: string, f: AgentFailure): string {
+  return `${role}: ${f.reason}${f.detail ? ` (${f.detail})` : ""}`;
+}
+
+/**
+ * runAgent, plus the failure classification, plus ONE retry when the failure is the momentary kind.
+ * The caller gets `failure != null` for "this never produced a result" and can then refuse to treat the
+ * missing artifact as an answer about the target. js-miners already had this shape (it walks a model
+ * chain on a non-zero exit); the hunter, validator and reporter did not.
+ */
+export async function runAgentChecked(
+  spec: AgentSpec,
+  prompt: string,
+  opts: { cwd: string; addDirs?: string[]; allowedTools?: string[]; timeoutMs?: number; outFile?: string },
+  retry: { delayMs?: number } = {},
+): Promise<{ res: CliResult; failure: AgentFailure | null }> {
+  let res = await runAgent(spec, prompt, opts);
+  let failure = agentFailure(res);
+  if (failure?.retryNow) {
+    const wait = retry.delayMs ?? Number(process.env.AGENT_RETRY_DELAY_MS ?? 30_000);
+    warn(`[${spec.role}] ${failure.reason} -> one retry in ${Math.round(wait / 1000)}s`);
+    await new Promise((r) => setTimeout(r, wait));
+    res = await runAgent(spec, prompt, opts);
+    failure = agentFailure(res);
+  }
+  if (failure) {
+    warn(`[${spec.role}] produced NO result: ${failure.reason}${failure.detail ? ` (${failure.detail})` : ""}`);
+  }
+  return { res, failure };
+}
+
 // One entry point for every stage: the CLI is picked from the spec's provider, which config.ts derives
 // from the model id (claude-* -> Max subscription, glm-* -> GLM Coding Plan, deepseek-* -> DeepSeek, gpt-*
 // -> codex). Codex gets the workspace-write sandbox (network per codex config) and, optionally, -o outFile.

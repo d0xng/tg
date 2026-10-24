@@ -1,7 +1,7 @@
 import { join } from "path";
 import { readFileSync, writeFileSync, statSync, rmSync, existsSync } from "fs";
 import { agents, PROMPTS_DIR, timeouts, type AgentSpec } from "../config.ts";
-import { runAgent } from "../cli.ts";
+import { failureSummary, runAgentChecked, type AgentFailure } from "../cli.ts";
 import { jsonl, log, warn } from "../log.ts";
 import type { Run } from "../run.ts";
 
@@ -47,9 +47,18 @@ async function huntLead(run: Run, spec: AgentSpec, leadFile: string, methodology
   const leadBase = leadFile.replace(/\.md$/, "");
   const tag = tagOf(spec);
   const outName = `${leadBase}__${tag}.md`;
-  await huntOneLead(run, spec, leadFile, methodology, outName);
+  const failure = await huntOneLead(run, spec, leadFile, methodology, outName);
   const out = join(run.sub("findings"), outName);
   const confirmed = existsSync(out);
+  if (failure && !confirmed) {
+    // The hunter never produced a result, so this lead was not attempted. Filing it as
+    // `confirmed: false` would record a session limit as "this lead is not exploitable", and nothing
+    // would ever come back to it. Say NOT ATTEMPTED and keep the lead alive for a re-run.
+    run.noteFailure(failureSummary(spec.role, failure));
+    jsonl(run.logFile, { stage: "hunting", event: "lead:failed", lead: leadBase, model: tag, reason: failure.reason, detail: failure.detail });
+    log(`[hunters] ${leadBase}: NOT ATTEMPTED by ${tag} (${failure.reason})`);
+    return;
+  }
   jsonl(run.logFile, { stage: "hunting", event: "lead:attempt", lead: leadBase, model: tag, confirmed });
   if (!confirmed) {
     log(`[hunters] ${leadBase}: unconfirmed by ${tag}`);
@@ -63,7 +72,9 @@ async function huntLead(run: Run, spec: AgentSpec, leadFile: string, methodology
   log(`[hunters] ${leadBase}: confirmed by ${tag}`);
 }
 
-async function huntOneLead(run: Run, spec: AgentSpec, leadFile: string, methodology: string, outName: string): Promise<void> {
+// Returns the failure when the invocation never produced a result, so the caller can tell "the hunter
+// worked this lead and could not exploit it" from "the hunter never ran".
+async function huntOneLead(run: Run, spec: AgentSpec, leadFile: string, methodology: string, outName: string): Promise<AgentFailure | null> {
   const leadContent = readFileSync(join(run.sub("leads"), leadFile), "utf8");
   const prompt = [
     methodology,
@@ -83,21 +94,26 @@ async function huntOneLead(run: Run, spec: AgentSpec, leadFile: string, methodol
   ].join("\n");
 
   jsonl(run.logFile, { stage: "hunting", event: "hunter:start", hunter: spec.role, lead: leadFile });
+  let failure: AgentFailure | null = null;
   try {
-    const res = await runAgent(spec, prompt, {
+    const checked = await runAgentChecked(spec, prompt, {
       cwd: run.dir,
       addDirs: ["/opt/huntline/skills"],
       timeoutMs: timeouts.hunterMs,
       outFile: join(run.sub("logs"), `hunter-${spec.role}-${leadFile}.last.txt`), // codex only
     });
+    failure = checked.failure;
+    const res = checked.res;
     writeFileSync(
       join(run.sub("logs"), `hunter-${spec.role}-${leadFile}.out.log`),
       `exit=${res.code} timedOut=${res.timedOut}\n==STDOUT==\n${res.stdout}\n==STDERR==\n${res.stderr}\n`,
     );
   } catch (e) {
     warn(`[hunters] ${spec.role} failed on ${leadFile}: ${String(e)}`);
+    failure = { reason: String(e), retryNow: false };
   }
   jsonl(run.logFile, { stage: "hunting", event: "hunter:done", hunter: spec.role, lead: leadFile });
+  return failure;
 }
 
 // Canonicalize per-model finding files (<leadbase>__<tag>.md) to one <leadbase>.md per lead. With the
