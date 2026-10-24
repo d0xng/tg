@@ -6,7 +6,7 @@ import { notify } from "../telegram.ts";
 import { expandScope } from "../recon/expand.ts";
 import { Run } from "../run.ts";
 import { orchestrate } from "../orchestrator.ts";
-import { liveRunDirs, runActivityAgeMin } from "../util/procs.ts";
+import { liveRunDirs, ownerAlive, runActivityAgeMin } from "../util/procs.ts";
 import { log, warn } from "../log.ts";
 
 // The recon agent is the conversational front of the pipeline. Each Telegram message is appended to a
@@ -52,9 +52,16 @@ export function statusReport(): string {
     if (TERMINAL.has(st.stage)) continue;
     const full = join(RUNS_DIR, d);
     const age = runActivityAgeMin(full);
-    if (live.has(full) || age <= ACTIVE_MIN) {
+    // Same liveness the watchdog uses, deliberately: `status` saying "active" while the watchdog has
+    // already killed the run (ACTIVE_MIN 20 against STALL_MIN 15) was its own small lie.
+    const owned = ownerAlive(st.owner);
+    if (owned || live.has(full) || age <= ACTIVE_MIN) {
       const c = st.counts ?? {};
-      const proc = live.has(full) ? "process alive" : `last activity ${age}m ago`;
+      const proc = owned
+        ? `owner pid ${st.owner.pid} alive`
+        : live.has(full)
+          ? "process alive"
+          : `last activity ${age}m ago`;
       active.push(`- ${st.domain}: ${st.stage} (js ${c.jsFiles ?? 0}, leads ${c.leads ?? 0}, findings ${c.findings ?? 0}; ${proc})`);
     } else {
       stale++;

@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { RUNS_DIR } from "./config.ts";
-import { liveRunDirs, runActivityAgeMin, killRunProcesses } from "./util/procs.ts";
+import { liveRunDirs, ownerAlive, runActivityAgeMin, killRunProcesses } from "./util/procs.ts";
 import { notify } from "./telegram.ts";
 import { log } from "./log.ts";
 
@@ -23,6 +23,10 @@ import { log } from "./log.ts";
 
 const STALL_MIN = Number(process.env.WATCHDOG_STALL_MIN ?? 15);
 const ALERT_FRESH_MIN = Number(process.env.WATCHDOG_ALERT_FRESH_MIN ?? 120);
+// A run whose owner process is ALIVE is never killed, however quiet it is. Past this many minutes of
+// silence it is reported instead, so the operator can look. Killing on a guess is the failure this
+// whole mechanism exists to stop.
+const SILENT_MIN = Number(process.env.WATCHDOG_SILENT_MIN ?? 90);
 const TERMINAL = new Set(["done", "error"]);
 
 async function main() {
@@ -35,6 +39,7 @@ async function main() {
   const live = liveRunDirs(RUNS_DIR);
   const running: string[] = [];
   const freshStalls: string[] = [];
+  const silent: string[] = [];
   let wedged = 0;
 
   for (const d of dirs) {
@@ -48,6 +53,22 @@ async function main() {
     if (TERMINAL.has(st.stage)) continue;
 
     const age = runActivityAgeMin(full);
+
+    // 1. The owner process is alive, so the run is alive. No threshold is involved, and that is the
+    //    point: the orchestrator runs with its cwd at the repo root so liveRunDirs can never see it, and
+    //    at a stage boundary there is no agent to see either, so every inferred signal reads "dead"
+    //    while the run is simply mid-flight. That inference killed a confirmed IDOR's validator on
+    //    2026-10-24 and cost nine VALID findings their reports two days earlier.
+    if (ownerAlive(st.owner)) {
+      running.push(`${st.domain} (${st.stage})`);
+      if (age > SILENT_MIN) {
+        silent.push(`- ${st.domain}: ${st.stage}, owner pid ${st.owner.pid} is alive but nothing has been written for ${age}m`);
+        log(`[watchdog] ${st.domain}: owner alive, silent ${age}m -> REPORTED, not touched`);
+      }
+      continue;
+    }
+    // 2. No owner record (a run started before that field existed), but a stage agent is working it, or
+    //    the run wrote something recently. Same heuristics as before, now only a fallback.
     if (live.has(full) || age <= STALL_MIN) {
       running.push(`${st.domain} (${st.stage})`);
       continue;
@@ -73,10 +94,17 @@ async function main() {
 
   // Heartbeat to the LOG only (never Telegram): one line per pass so `tail huntline-watchdog.log` proves
   // the cron is alive even when there is nothing to report.
-  log(`[watchdog] pass: running=${running.length} wedged=${wedged} fresh-alert=${freshStalls.length}`);
+  log(
+    `[watchdog] pass: running=${running.length} wedged=${wedged} fresh-alert=${freshStalls.length} silent=${silent.length}`,
+  );
 
-  if (freshStalls.length) {
-    const body = ["Watchdog: run(s) stopped making progress and were marked dead:", ...freshStalls];
+  if (freshStalls.length || silent.length) {
+    const body: string[] = [];
+    if (freshStalls.length) body.push("Watchdog: run(s) stopped making progress and were marked dead:", ...freshStalls);
+    if (silent.length) {
+      if (body.length) body.push("");
+      body.push("Watchdog: run(s) still owned by a live process but quiet for a long time (NOT touched):", ...silent);
+    }
     body.push("", running.length ? "Still running: " + running.join(", ") : "No run is currently active.");
     await notify(body.join("\n"));
   }

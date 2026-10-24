@@ -158,6 +158,45 @@ export function liveRunDirs(runsDir: string): Set<string> {
   return live;
 }
 
+export interface RunOwner {
+  /** The orchestrator process that owns the run. */
+  pid: number;
+  /** Its start time in clock ticks since boot (field 22 of /proc/<pid>/stat). */
+  startedAt: number;
+}
+
+// Start time of a pid, in clock ticks since boot. Field 22 of /proc/<pid>/stat, counting from the LAST
+// ')' because comm is parenthesised and may contain spaces. Null when the process is gone.
+export function procStartTime(pid: number): number | null {
+  let stat: string;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return null;
+  }
+  const close = stat.lastIndexOf(")");
+  if (close < 0) return null;
+  const f = stat.slice(close + 2).split(" "); // f[0] is `state`, so field 22 is f[19]
+  const v = Number(f[19]);
+  return Number.isFinite(v) ? v : null;
+}
+
+/**
+ * Is the process that claimed this run still alive? This is the ONE authoritative liveness signal, and
+ * it exists because every other one is a guess: the orchestrator runs with its cwd at the repo root, so
+ * liveRunDirs cannot see it, and between two stage agents there is no agent to see either. A run was
+ * therefore declared dead and killed whenever it sat in a stage boundary longer than the stall window,
+ * which is how a confirmed IDOR on henkeldx.com lost its validator mid-flight on 2026-10-24.
+ *
+ * The start time is compared as well as the pid: a pid gets recycled, and a recycled pid would make a
+ * dead run look alive for as long as the box stays up, which is the opposite failure and worse.
+ */
+export function ownerAlive(owner?: RunOwner): boolean {
+  if (!owner || !owner.pid) return false;
+  const st = procStartTime(owner.pid);
+  return st !== null && st === owner.startedAt;
+}
+
 // Minutes since a run dir last showed ANY file activity, or a large number if none. We take the most
 // recent mtime across the run's own marker AND its output subdirs: a directory's mtime bumps whenever a
 // file is added to or removed from it, so a healthy crawl (writing into js/) or a hunter (writing into

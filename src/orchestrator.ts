@@ -39,6 +39,9 @@ function titleOf(run: Run, sub: "leads" | "findings", file: string): string {
 export async function orchestrate(run: Run, opts: OrchestrateOpts = {}): Promise<void> {
   const dom = () => mdEscape(run.state.domain);
   jsonl(run.logFile, { event: "run:start", domain: run.state.domain });
+  // Claim the run for this process, so the watchdog can ask whether the owner is alive instead of
+  // inferring death from a quiet stage boundary.
+  run.claim();
   // A stage whose agents never produced a result has told us NOTHING about the target, so the run must
   // not end `done`. Called before every "nothing here" exit and before the final done: that is what
   // stops a 429 session limit from being filed as "no bugs on this target", which is exactly what

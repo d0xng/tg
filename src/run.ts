@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from "fs";
 import { join } from "path";
 import { RUNS_DIR } from "./config.ts";
+import { procStartTime } from "./util/procs.ts";
 import { ts } from "./log.ts";
 
 export type Stage =
@@ -33,6 +34,11 @@ export interface RunState {
    * `done`, and whatever is listed is worth re-running once the limit resets.
    */
   failures?: string[];
+  /**
+   * The orchestrator process that owns this run. Written once, at the start, so the watchdog can ask
+   * "is the owner alive" instead of inferring death from the absence of recent file writes.
+   */
+  owner?: { pid: number; startedAt: number };
 }
 
 // The funnel on disk. Every stage reads the previous stage's directory and writes its own.
@@ -93,6 +99,17 @@ export class Run {
 
   setStage(s: Stage): void {
     this.state.stage = s;
+    this.save();
+  }
+
+  // Claim this run for the current process. The watchdog reads this instead of guessing: a run whose
+  // owner is alive is alive, with no threshold involved, however long its current agent has been
+  // thinking. Called by the orchestrator; a stage re-entered on its own (validate-run and friends) does
+  // not claim, because it is not the run's owner.
+  claim(): void {
+    const startedAt = procStartTime(process.pid);
+    if (startedAt === null) return; // no /proc: leave the old heuristics in charge
+    this.state.owner = { pid: process.pid, startedAt };
     this.save();
   }
 
