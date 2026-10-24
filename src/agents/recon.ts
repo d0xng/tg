@@ -7,6 +7,8 @@ import { expandScope } from "../recon/expand.ts";
 import { Run } from "../run.ts";
 import { orchestrate } from "../orchestrator.ts";
 import { liveRunDirs, ownerAlive, runActivityAgeMin } from "../util/procs.ts";
+import { owesWork, pendingWork } from "../pending.ts";
+import { pendingLines, resumeRun, resumeSummary } from "../resume.ts";
 import { log, warn } from "../log.ts";
 
 // The recon agent is the conversational front of the pipeline. Each Telegram message is appended to a
@@ -23,6 +25,10 @@ interface Turn {
 const histories = new Map<number, Turn[]>();
 const MAX_TURNS = 24;
 let busy = false;
+// Runs with a resume in flight. This is NOT a concurrency policy: several runs may resume at once, and
+// several may overlap a fresh run, because that is how d0x works the subscriptions on purpose. It only
+// stops the SAME run being resumed twice at the same time, which would pay twice for the same findings.
+const resuming = new Set<string>();
 
 // liveRunDirs and runActivityAgeMin live in util/procs.ts, shared with the watchdog.
 
@@ -74,6 +80,44 @@ export function statusReport(): string {
   return parts.join("\n");
 }
 
+/**
+ * Finished runs that still owe validations or reports, with their ids, so the operator can act from the
+ * same chat the watchdog alerted in. Pure disk: no LLM, no process, instant.
+ */
+export function owedReport(): string {
+  const TERMINAL = new Set(["done", "error"]);
+  let dirs: string[] = [];
+  try {
+    dirs = readdirSync(RUNS_DIR).filter((d) => /\dZ_/.test(d));
+  } catch {
+    /* no runs dir yet */
+  }
+  dirs.sort().reverse();
+  const lines: string[] = [];
+  for (const d of dirs) {
+    let st: any;
+    try {
+      st = JSON.parse(readFileSync(join(RUNS_DIR, d, "run.json"), "utf8"));
+    } catch {
+      continue;
+    }
+    if (!TERMINAL.has(st.stage)) continue;
+    const p = pendingWork(join(RUNS_DIR, d));
+    if (!owesWork(p)) continue;
+    lines.push(`- ${st.domain}: ${p.needValidation.length} to validate, ${p.needReport.length} to report`);
+    lines.push(`  resume ${d}`);
+  }
+  if (!lines.length) return "No finished run owes any work.";
+  return [
+    "Finished runs that still owe work:",
+    ...lines,
+    "",
+    'Send "resume <runId>" to do only what is missing, or "resume <runId> dry" to see it first.',
+  ].join("\n");
+}
+
+const DRY = /^(dry|dry-run|--dry-run)$/i;
+
 export async function handleMessage(text: string, chatId: number): Promise<void> {
   // Status command: answered instantly from disk, never routed to the recon LLM, never touches busy,
   // so it works even while a run is in flight.
@@ -82,6 +126,63 @@ export async function handleMessage(text: string, chatId: number): Promise<void>
     await notify(statusReport());
     return;
   }
+  // Resume, answered without the LLM like `status`. The watchdog's "this run owes work" alert arrives in
+  // this chat, on a phone, so acting on it has to be possible from here instead of requiring an ssh
+  // session. Parsed from the RAW text and never from the lowercased copy, because a run id carries an
+  // uppercase T and Z.
+  //   resume                -> list the runs that owe work, with their ids
+  //   resume <runId> dry    -> what it would do, spends nothing
+  //   resume <runId>        -> do only what is missing
+  const tok = text.trim().replace(/^\//, "").split(/\s+/);
+  if (tok[0] && tok[0].toLowerCase() === "resume") {
+    const args = tok.slice(1);
+    const dry = args.some((a) => DRY.test(a));
+    const id = args.find((a) => !DRY.test(a));
+    if (!id) {
+      await notify(owedReport());
+      return;
+    }
+    let run: Run;
+    try {
+      run = Run.load(id);
+    } catch {
+      await notify(`No run called "${id}". Send "resume" with no id to list the ones that owe work.`);
+      return;
+    }
+    const p = pendingWork(run.dir);
+    if (dry) {
+      await notify(
+        [
+          `${run.state.domain} (${id})`,
+          `${p.needValidation.length} to validate, ${p.needReport.length} to report.`,
+          ...pendingLines(p),
+          owesWork(p) ? "(nothing spent)" : "nothing pending",
+        ].join("\n"),
+      );
+      return;
+    }
+    if (!owesWork(p)) {
+      await notify(`${run.state.domain}: nothing pending.`);
+      return;
+    }
+    if (resuming.has(id)) {
+      await notify(`${run.state.domain}: a resume is already running for that run.`);
+      return;
+    }
+    resuming.add(id);
+    await notify(
+      `Resuming ${run.state.domain}: ${p.needValidation.length} to validate, ${p.needReport.length} to report. I will report back when it finishes.`,
+    );
+    // Detached on purpose, exactly like launch(): awaiting here would block the poll loop for the whole
+    // resume and the bot would go mute. Not gated on `busy` either, because running several at once is
+    // deliberate here.
+    resumeRun(run)
+      .then((r) => notify(resumeSummary(run, r)))
+      .catch((e) => notify(`Resume failed on ${run.state.domain}: ${String(e)}`))
+      .finally(() => resuming.delete(id));
+    return;
+  }
+
   const methodology = readFileSync(join(PROMPTS_DIR, "recon.md"), "utf8");
   const hist = histories.get(chatId) ?? [];
   hist.push({ role: "operator", content: text });
