@@ -48,9 +48,12 @@ class CDP {
   private id = 0;
   private pending = new Map<number, { res: (v: any) => void; rej: (e: any) => void }>();
   private handlers = new Map<string, ((p: any) => void)[]>();
+  /** The operator asked for this run to stop; every in-flight and future call gives up at once. */
+  private stopped?: () => boolean;
 
-  constructor(url: string) {
+  constructor(url: string, stopped?: () => boolean) {
     this.ws = new WebSocket(url);
+    this.stopped = stopped;
   }
   open(): Promise<void> {
     return new Promise((res, rej) => {
@@ -76,17 +79,53 @@ class CDP {
       for (const h of this.handlers.get(d.method) ?? []) h(d.params);
     }
   }
+  /**
+   * One CDP call. The deadline is polled rather than set once, so a stop request aborts a call that is
+   * ALREADY in flight instead of waiting out its timeout.
+   *
+   * That difference is worth the extra timer. A stop kills Chrome, and from then on every CDP call hangs
+   * until its own 30 second timeout: the page body makes nine of them (navigate, currentUrl, inlines,
+   * links, two clickAll passes, ...) each inside its own try/catch that swallows the error and moves to
+   * the next, so none of them short-circuits the rest. Measured on a real stop against google.com: the
+   * crawl took 2m08s to notice, while the operator had been told "seconds".
+   */
   send<T = any>(method: string, params: Record<string, unknown> = {}, timeoutMs = 30000): Promise<T> {
     const id = ++this.id;
     return new Promise<T>((res, rej) => {
-      const timer = setTimeout(() => {
-        if (this.pending.delete(id)) rej(new Error("CDP timeout: " + method));
-      }, timeoutMs);
+      if (this.stopped?.()) {
+        rej(new Error("CDP aborted: stop requested"));
+        return;
+      }
+      const deadline = Date.now() + timeoutMs;
+      const timer = setInterval(() => {
+        if (!this.pending.has(id)) {
+          clearInterval(timer);
+          return;
+        }
+        if (this.stopped?.()) {
+          this.pending.delete(id);
+          clearInterval(timer);
+          rej(new Error("CDP aborted: stop requested"));
+          return;
+        }
+        if (Date.now() >= deadline) {
+          this.pending.delete(id);
+          clearInterval(timer);
+          rej(new Error("CDP timeout: " + method));
+        }
+      }, 250);
       this.pending.set(id, {
-        res: (v) => { clearTimeout(timer); res(v); },
-        rej: (e) => { clearTimeout(timer); rej(e); },
+        res: (v) => { clearInterval(timer); res(v); },
+        rej: (e) => { clearInterval(timer); rej(e); },
       });
-      this.ws.send(JSON.stringify({ id, method, params }));
+      try {
+        this.ws.send(JSON.stringify({ id, method, params }));
+      } catch (e) {
+        // Sending on a socket Chrome already closed: fail now instead of leaving the timer to find out.
+        this.pending.delete(id);
+        clearInterval(timer);
+        rej(e as Error);
+      }
     });
   }
   on(method: string, h: (p: any) => void): void {
@@ -272,7 +311,7 @@ export async function crawl(
   let pages = 0;
   try {
     const wsUrl = await pageWebSocket(port);
-    cdp = new CDP(wsUrl);
+    cdp = new CDP(wsUrl, opts.shouldStop);
     await cdp.open();
 
     await cdp.send("Network.enable");
@@ -532,7 +571,10 @@ export async function crawl(
     const chunkDelayMs = Number(process.env.CRAWL_CHUNK_DELAY_MS ?? 150);
     const runDiscoverer = async (filePath: string): Promise<string[]> => {
       try {
+        // cwd inside the run dir so killRunProcesses can reap it: this subprocess used to inherit the
+        // repo root, which made it invisible to the reaper, and it has no timeout of its own.
         const proc = Bun.spawn([process.execPath, "run", CHUNK_DISCOVERER, filePath, String(bruteforceLimit)], {
+          cwd: jsDir,
           stdout: "pipe",
           stderr: "ignore",
         });
@@ -582,8 +624,13 @@ export async function crawl(
       }
     };
     const prefetchChunks = async (): Promise<void> => {
+      // This stage does not touch CDP at all: it fetches out of band and shells out to the discoverer, so
+      // aborting CDP does nothing for it. Without its own check a stopped run could sit here working
+      // through thousands of candidate chunk URLs long after the walk was abandoned.
+      if (opts.shouldStop?.()) return;
       let total = 0;
       for (let round = 0; round < 2; round++) {
+        if (opts.shouldStop?.()) return;
         const candidates = new Set<string>();
         for (const [u, f] of Object.entries(manifest)) {
           if (!/^https?:/i.test(u)) continue; // skip inline
@@ -598,6 +645,7 @@ export async function crawl(
         if (!todo.length) break;
         let roundNew = 0;
         const tasks = todo.map((u) => async () => {
+          if (opts.shouldStop?.()) return;
           if (await fetchAndSaveChunk(u)) roundNew++;
           await delay(chunkDelayMs);
         });
