@@ -94,9 +94,18 @@ async function main() {
       }
       continue;
     }
-    // 2. No owner record (a run started before that field existed), but a stage agent is working it, or
-    //    the run wrote something recently. Same heuristics as before, now only a fallback.
-    if (live.has(full) || age <= STALL_MIN) {
+    // 2. The run HAS an owner and that owner is gone, so it is dead no matter what the directory's mtime
+    //    says. mtime answers "did someone touch this", not "is the run progressing": an operator reading
+    //    the evidence, or running a validation pass by hand in the run dir, keeps it fresh, and that made
+    //    a run whose process died an hour earlier keep reading as alive for as long as they worked in it
+    //    (measured on pattex.com.cn, 2026-10-24). An unowned run cannot advance past the stage it
+    //    stopped in, so there is nothing left to protect; and if a stage agent somehow outlived its
+    //    orchestrator, falling through here is what reaps it instead of letting it spend on a run nobody
+    //    is tracking.
+    const owned = typeof st.owner?.pid === "number" && st.owner.pid > 0;
+    // 3. No owner record (a run started before that field existed): the old heuristics, now only a
+    //    fallback, because for those a live stage agent or a recent write is all there is to go on.
+    if (!owned && (live.has(full) || age <= STALL_MIN)) {
       running.push(`${st.domain} (${st.stage})`);
       continue;
     }
